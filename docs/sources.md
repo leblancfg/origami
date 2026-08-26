@@ -4,12 +4,12 @@
 
 - [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)
 - [Qwen technical report](https://github.com/QwenLM/Qwen3.8-Flash-Next/blob/main/tech_report.pdf)
-- [Unsloth dynamic GGUFs](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)
+- [Unsloth dynamic GGUFs](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF), pinned for the proof of concept at revision [`d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249/UD-IQ1_S)
 - [Official FP8 checkpoint](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8)
 
 ## Reference implementations
 
-- [llama.cpp Qwen4Exp support, PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742)
+- [llama.cpp Qwen4Exp support, PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742), pinned for the proof of concept at commit [`bea3b12daee45876b0129a3602dc8f534ce30bf0`](https://github.com/ggml-org/llama.cpp/commit/bea3b12daee45876b0129a3602dc8f534ce30bf0)
 - [Unsloth llama.cpp Qwen4Exp branch, PR #111](https://github.com/unslothai/llama.cpp/pull/111)
 - [Transformers Qwen4Exp implementation](https://github.com/huggingface/transformers/pull/48337)
 - [vLLM deployment recipe](https://recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next)

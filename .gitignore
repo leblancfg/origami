@@ -12,6 +12,7 @@ __pycache__/
 /models/
 /captures/
 /bench-results/
+/artifacts/
 *.gguf
 *.safetensors
 *.log

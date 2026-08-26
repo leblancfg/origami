@@ -29,6 +29,8 @@ The current GGUF appears text-only. Its tensor inventory contains neither vision
 - Capture greedy tokens and selected intermediate tensors for short prompts.
 - Record the exact GGUF revision and llama.cpp commit.
 
+The external backend now builds reproducibly at `bea3b12daee45876b0129a3602dc8f534ce30bf0`. The first model is pinned at `d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249`. The short-context mmap profile and telemetry harness are in [poc.md](poc.md). A complete model run is still required before this milestone meets its exit condition.
+
 Exit condition: repeatable reference output and a known-good command line.
 
 ## Milestone 1: metadata and allocation ledger

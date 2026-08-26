@@ -2,7 +2,19 @@
 
 Origami is an experimental inference project for running sparse models whose full weights do not fit in memory. The first target is Qwen3.8-Flash-Next on 64 GB Apple Silicon, with routed experts streamed from SSD.
 
-The repository is private and exploratory. There is no working runtime yet. [INTENT.md](INTENT.md) defines the hardware budget, scope, and engineering rules.
+The repository is private and exploratory. Origami does not have its own runtime yet. [INTENT.md](INTENT.md) defines the hardware budget, scope, and engineering rules.
+
+## Runnable reference path
+
+A pinned llama.cpp proof of concept is available while the native runtime is under development:
+
+```sh
+scripts/bootstrap-llama-cpp.sh
+scripts/verify-model.sh /path/to/UD-IQ1_S
+scripts/smoke-test.sh /path/to/UD-IQ1_S
+```
+
+The scripts build llama.cpp outside the repository, never download model weights, and reject incomplete Unsloth shards. The launch profile limits context and batches, requests a CPU mmap buffer for the PLE table, and records output plus memory and swap telemetry. This remains an mmap baseline under macOS paging, not the bounded expert and PLE streaming design described below. See [docs/poc.md](docs/poc.md) for the exact revisions, launch command, and current blockers.
 
 ## Working hypothesis
 
