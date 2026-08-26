@@ -1,0 +1,17 @@
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 1b058d82b..887aa5a76 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -30,2 +30,3 @@
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+@@ -1666,2 +1667,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++    const char * mmap_prefetch_env = std::getenv("LLAMA_MMAP_PREFETCH");
++    const bool mmap_prefetch = mmap_prefetch_env == nullptr || std::strcmp(mmap_prefetch_env, "0") != 0;
++    if (!mmap_prefetch) {
++        LLAMA_LOG_INFO("%s: mmap prefetch disabled by LLAMA_MMAP_PREFETCH=0\n", __func__);
++    }
++    ml.init_mappings(mmap_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
