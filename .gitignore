@@ -1,0 +1,17 @@
+.DS_Store
+.idea/
+.vscode/
+.venv/
+__pycache__/
+*.pyc
+
+/build/
+/cmake-build-*/
+/target/
+
+/models/
+/captures/
+/bench-results/
+*.gguf
+*.safetensors
+*.log
