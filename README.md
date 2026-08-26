@@ -36,3 +36,14 @@ The first implementation should optimize correctness and memory accounting. Expe
 - Performance: stable interactive decoding without relying on accidental `mmap` cache behavior
 
 See [docs/plan.md](docs/plan.md) for the bring-up sequence and [docs/sources.md](docs/sources.md) for upstream work.
+
+## Artifact inspector
+
+The dependency-free Python inspector reads split GGUF metadata without mapping tensor bodies. It produces a tensor inventory, allocation ledger, and contiguous expert slices:
+
+```sh
+python3 -m origami_artifacts /path/to/gguf/shards
+python3 -m origami_artifacts /path/to/gguf/shards --json --output ledger.json
+```
+
+It rejects unsupported quantization and routed layouts. See [docs/artifact-inspector.md](docs/artifact-inspector.md) for allocation budgets, bounded span probes, and the current Qwen4Exp layout contract.
