@@ -35,7 +35,7 @@ The first implementation should optimize correctness and memory accounting. Expe
 - Correctness: greedy token parity with a resident reference run
 - Performance: stable interactive decoding without relying on accidental `mmap` cache behavior
 
-See [docs/plan.md](docs/plan.md) for the bring-up sequence and [docs/sources.md](docs/sources.md) for upstream work.
+See [docs/plan.md](docs/plan.md) for the bring-up sequence, [docs/validation.md](docs/validation.md) for the macOS smoke-test harness, and [docs/sources.md](docs/sources.md) for upstream work.
 
 ## Artifact inspector
 

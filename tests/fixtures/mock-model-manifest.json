@@ -1,0 +1,17 @@
+{
+  "schema_version": "origami.model-manifest.v1",
+  "model": {
+    "id": "origami/mock-model",
+    "revision": "fixture-v1",
+    "format": "GGUF",
+    "quantization": "mock"
+  },
+  "entrypoint": "mock-model.bin",
+  "shards": [
+    {
+      "path": "mock-model.bin",
+      "size_bytes": 16,
+      "sha256": "4fe064aaae7e584a96e597f10639fcfe3f4ae4f4ad6cc6111c13cd29b29a8882"
+    }
+  ]
+}

@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://origami.invalid/schemas/validation-result.v1.json",
+  "title": "Origami PoC validation result",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "status",
+    "started_at",
+    "finished_at",
+    "project",
+    "smoke_test"
+  ],
+  "properties": {
+    "schema_version": { "const": "origami.validation-result.v1" },
+    "status": { "enum": ["pass", "error"] },
+    "started_at": { "type": "string", "format": "date-time" },
+    "finished_at": { "type": "string", "format": "date-time" },
+    "error": { "type": "string" },
+    "project": {
+      "type": "object",
+      "required": ["commit", "worktree_dirty", "harness_path", "harness_sha256"]
+    },
+    "machine": { "type": "object" },
+    "model_storage": { "type": "object" },
+    "runtime": {
+      "type": "object",
+      "required": ["path", "revision", "version_output", "size_bytes", "sha256"]
+    },
+    "model": {
+      "type": "object",
+      "required": ["id", "revision", "format", "quantization", "entrypoint", "shards"]
+    },
+    "smoke_test": {
+      "type": "object",
+      "required": ["name", "prompt", "prompt_sha256", "n_predict", "seed", "temperature"]
+    },
+    "command": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "run": {
+      "type": "object",
+      "required": [
+        "exit_code",
+        "timed_out",
+        "wall_elapsed_seconds",
+        "stdout",
+        "stdout_sha256",
+        "stderr",
+        "timings"
+      ],
+      "properties": {
+        "exit_code": { "type": "integer" },
+        "timed_out": { "type": "boolean" },
+        "wall_elapsed_seconds": { "type": "number", "minimum": 0 },
+        "stdout": { "type": "string" },
+        "stdout_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "stderr": { "type": "string" },
+        "timings": {
+          "type": "object",
+          "properties": {
+            "load": { "$ref": "#/$defs/timing" },
+            "prefill": { "$ref": "#/$defs/timing" },
+            "decode": { "$ref": "#/$defs/timing" },
+            "total": { "$ref": "#/$defs/timing" }
+          }
+        }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "required": ["before", "during", "after", "process_rss_samples", "summary"]
+    }
+  },
+  "$defs": {
+    "timing": {
+      "type": "object",
+      "required": ["elapsed_ms"],
+      "properties": {
+        "elapsed_ms": { "type": "number", "minimum": 0 },
+        "tokens": { "type": "integer", "minimum": 0 },
+        "ms_per_token": { "type": "number", "minimum": 0 },
+        "tokens_per_second": { "type": "number", "minimum": 0 }
+      }
+    }
+  }
+}
