@@ -1,6 +1,16 @@
-# Qwen3.8-Flash-Next llama.cpp proof of concept
+# Qwen3.8-Flash-Next llama.cpp PoC
 
-This path uses llama.cpp as an external backend. The bootstrap script fetches commit `bea3b12daee45876b0129a3602dc8f534ce30bf0`, the head of Qwen4Exp PR #27742 used for this bring-up, and builds it outside the Origami worktree.
+## Fixed identities
+
+| Component | Identity |
+|---|---|
+| llama.cpp | `bea3b12daee45876b0129a3602dc8f534ce30bf0` |
+| mmap patch | `patches/llama.cpp-bea3b12-mmap-prefetch-optout.patch` |
+| model | `unsloth/Qwen3.8-Flash-Next-GGUF` |
+| model revision | `d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249` |
+| quantization | `UD-IQ1_S` |
+
+`config/qwen38-flash-next-ud-iq1_s.json` conforms to `validation/model-manifest.schema.json` and pins each shard's byte size and SHA-256. None of the repository commands download model files.
 
 ## Build
 
@@ -10,62 +20,73 @@ The build needs CMake, Git, and the macOS command-line developer tools.
 scripts/bootstrap-llama-cpp.sh
 ```
 
-The default dependency directory is `/private/tmp/origami-deps`. Set `ORIGAMI_DEPS_ROOT` to put it elsewhere. The script checks the remote URL and full commit before building `llama-cli` and `test-llama-archs`. It does not fetch model files.
+The script creates `/private/tmp/origami-deps/llama.cpp-bea3b12daee45876b0129a3602dc8f534ce30bf0` by default. `ORIGAMI_DEPS_ROOT` selects another external directory. The script performs these checks before producing revision and patch markers:
 
-This exact build completed on the M2 Max host. `llama-cli --list-devices` reported the M2 Max Metal device with 53,084 MiB. The synthetic Qwen4Exp architecture test passed its Metal and CPU comparisons, then aborted in the test's Meta backend. That Meta failure remains unresolved.
+1. Fetch and detach at the full pinned revision.
+2. Verify `HEAD`, apply the mmap patch idempotently, and verify that `HEAD` is unchanged.
+3. Reject patched changes outside `src/llama-model.cpp`.
+4. Build `llama-cli`, `test-llama-archs`, and `test-backend-ops`.
+5. check every PoC CLI option against the built binary's `--help` output.
 
-## Model
+## Preflight and launch
 
-Use the existing Unsloth download at revision `d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249`. The repository manifest records all three shard sizes and SHA-256 digests. Check sizes before launch:
-
-```sh
-scripts/verify-model.sh /path/to/UD-IQ1_S
-```
-
-A full digest pass is optional because it reads 72.5 GB:
+Use the checked-in manifest against the directory containing the three existing shards:
 
 ```sh
-scripts/verify-model.sh --sha256 /path/to/UD-IQ1_S
+scripts/smoke-test.sh --preflight-only /path/to/UD-IQ1_S
 ```
 
-Neither command downloads a model.
+Preflight rejects missing shards, wrong byte sizes, inconsistent split names, path aliases, and neighboring `.aria2` markers. Add `--verify-shards-sha256` for a full digest pass. Hashing reads every shard and changes filesystem cache state.
 
-## Launch profile
+The default launch is the first-token profile:
 
 ```sh
-scripts/launch-qwen38.sh /path/to/UD-IQ1_S \
-  --single-turn --prompt 'Reply with exactly: ORIGAMI_OK'
+scripts/smoke-test.sh /path/to/UD-IQ1_S
 ```
 
-The checked-in profile uses the following flags from the pinned binary's help:
-
-- 512 context tokens, a 64-token logical batch, and a 32-token physical batch
-- greedy sampling with seed 1 and temperature 0
-- `--load-mode mmap`, `--gpu-layers all`, and `--override-tensor '^per_layer_token_embd$=CPU'`
-- no warm-up and no CLI RAM prompt cache
-
-The tensor name comes from the pinned Qwen4Exp loader. Its graph calculates PLE row IDs on the host and calls `ggml_get_rows` on `per_layer_token_embd`. The profile requests a CPU buffer for that 28.8 GB table and Metal placement for all repeating layers. The full model run must confirm the resulting placement from the backend log.
-
-This is demand-paged mmap access, not Origami's planned SSD cache. The pinned backend has no bounded PLE row cache or explicit expert-streaming scheduler. Its direct-I/O load mode allocates model buffers and reads weights into them, so that mode does not solve the 72.5 GB capacity problem. The mmap profile is the shortest path that can plausibly run on this machine, but macOS controls eviction and its memory ceiling is not deterministic.
-
-Set `ORIGAMI_CONTEXT`, `ORIGAMI_PREDICT`, `ORIGAMI_BATCH`, or `ORIGAMI_UBATCH` to adjust the profile. Print the resolved invocation without starting inference:
+It uses a 512-token context, batch and microbatch sizes of 32, greedy sampling, mmap, full layer offload, no warm-up, and one generated token. The fixed sequence profile uses the same launch envelope and generates 16 tokens:
 
 ```sh
-scripts/launch-qwen38.sh --print-command /path/to/UD-IQ1_S
+scripts/smoke-test.sh --validation /path/to/UD-IQ1_S
 ```
 
-## Recorded smoke test
+Both commands run through `tools/origami_validate.py`; no shell telemetry loop remains. Results are written under `artifacts/` unless `--output FILE` is supplied.
+
+## Lazy mmap safeguards
+
+The harness launches the backend with:
+
+```text
+GGML_METAL_NO_RESIDENCY=1
+LLAMA_MMAP_PREFETCH=0
+```
+
+A successful result must contain both backend markers:
+
+```text
+mmap prefetch disabled by LLAMA_MMAP_PREFETCH=0
+use residency sets    = false
+```
+
+The patch changes only the initial mmap advice. The existing Metal variable prevents residency-set requests. Neither safeguard bounds the Darwin file cache, compressor use, or physical pages retained by the OS. Treat this as a memory-fit reference, not Origami's bounded expert-streaming design.
+
+Qwen4Exp already classifies `per_layer_token_embd.weight` as a CPU input tensor. The launch profile therefore has no tensor override for PLE. If Metal fails while creating the shard-2 virtual envelope, run the diagnostic fallback:
 
 ```sh
-scripts/smoke-test.sh --output artifacts/qwen38-smoke /path/to/UD-IQ1_S
+scripts/smoke-test.sh --shrink-metal-envelope /path/to/UD-IQ1_S
 ```
 
-The harness saves the resolved command, raw and ANSI-stripped output, an output SHA-256, backend logs, and a JSON host report. It samples process RSS and virtual size once per second. System-wide swap use, compressor pages, and pageouts are recorded alongside before-and-after `vm_stat` and `memory_pressure` snapshots.
+The wrapper adds `--override-tensor '^output=CPU'`. This moves the output projection to CPU so the Metal envelope starts after PLE; it is not part of the default profile.
 
-Pass a known output hash on later runs to enforce exact output:
+## Targeted Metal quant test
+
+The bootstrap builds the required test binary. Run the pinned backend's filtered comparison with residency sets disabled:
 
 ```sh
-scripts/smoke-test.sh --expect-sha256 HASH /path/to/UD-IQ1_S
+REV=bea3b12daee45876b0129a3602dc8f534ce30bf0
+GGML_METAL_NO_RESIDENCY=1 \
+  /private/tmp/origami-deps/llama.cpp-${REV}/build-origami/bin/test-backend-ops \
+  test -b MTL0 -o MUL_MAT_ID -p 'type_a=(iq1_s|iq2_xxs|iq4_nl)' -j 1
 ```
 
-The full smoke run is blocked until all three model shards finish downloading. No full-model memory or output result has been recorded yet.
+This covers the quantized expert dispatch types used by the pinned model. A full model result still depends on complete local shards.

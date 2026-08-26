@@ -2,7 +2,7 @@
 
 ## Constraints observed in the first GGUF
 
-Snapshot: 2026-08-26, Unsloth `UD-IQ1_S`.
+Artifact: Unsloth `UD-IQ1_S` at `d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249`.
 
 | Group | On-disk size |
 |---|---:|

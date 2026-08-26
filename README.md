@@ -1,61 +1,42 @@
 # Origami
 
-Origami is an experimental inference project for running sparse models whose full weights do not fit in memory. The first target is Qwen3.8-Flash-Next on 64 GB Apple Silicon, with routed experts streamed from SSD.
+Origami is an experimental inference project for sparse models whose full weights do not fit in memory. The first target is Qwen3.8-Flash-Next on 64 GB Apple Silicon. [INTENT.md](INTENT.md) defines the hardware budget and engineering rules.
 
-The repository is private and exploratory. Origami does not have its own runtime yet. [INTENT.md](INTENT.md) defines the hardware budget, scope, and engineering rules.
+## Pinned llama.cpp PoC
 
-## Runnable reference path
-
-A pinned llama.cpp proof of concept is available while the native runtime is under development:
+The reference path uses llama.cpp commit `bea3b12daee45876b0129a3602dc8f534ce30bf0` with the checked-in mmap prefetch patch. It never downloads model shards.
 
 ```sh
+# Build and verify the patched backend outside the worktree.
 scripts/bootstrap-llama-cpp.sh
-scripts/verify-model.sh /path/to/UD-IQ1_S
+
+# Reject missing, partial, or incorrectly sized shards.
+scripts/smoke-test.sh --preflight-only /path/to/UD-IQ1_S
+
+# Run the default short-context, one-token profile with telemetry.
 scripts/smoke-test.sh /path/to/UD-IQ1_S
+
+# Run the fixed 16-token validation profile.
+scripts/smoke-test.sh --validation /path/to/UD-IQ1_S
 ```
 
-The scripts build llama.cpp outside the repository, never download model weights, and reject incomplete Unsloth shards. The launch profile limits context and batches, requests a CPU mmap buffer for the PLE table, and records output plus memory and swap telemetry. This remains an mmap baseline under macOS paging, not the bounded expert and PLE streaming design described below. See [docs/poc.md](docs/poc.md) for the exact revisions, launch command, and current blockers.
+`tools/origami_validate.py` is the only telemetry implementation. `scripts/smoke-test.sh` supplies the pinned executable, manifest, runtime profile, and both required environment safeguards. The JSON result captures the command, backend log, host identity, process RSS, memory pressure, compression, and swap counters.
+
+The default run sets `GGML_METAL_NO_RESIDENCY=1` and `LLAMA_MMAP_PREFETCH=0`. A pass requires backend log lines proving that residency sets and mmap prefetch are disabled. This mmap path has no cache ceiling, so its memory use is not bounded. See [docs/poc.md](docs/poc.md) for the exact identities, expected log evidence, and Metal-envelope fallback.
 
 ## Working hypothesis
 
-Qwen3.8-Flash-Next is a good fit for explicit weight streaming:
+Qwen3.8-Flash-Next has 125B parameters but activates about 6B per token. Its 48 MoE layers select 10 of 512 routed experts plus one shared expert. The Unsloth `UD-IQ1_S` GGUF is 72.5 GB: about 39.8 GB of routed experts, a 28.8 GB n-gram table, and 3.9 GB of always-used tensors.
 
-- The language model has 125B parameters but activates about 6B per token.
-- Its 48 MoE layers select 10 of 512 routed experts, plus one shared expert.
-- The 51B n-gram embedding table needs a handful of row lookups per token and can remain on SSD behind a small row cache.
-- The always-used tensors in Unsloth's first GGUF occupy roughly 3.9 GB. They can remain resident while expert tensors and the n-gram table stay on disk.
+The native design will keep dense weights, shared experts, recurrent state, and a modest context resident. It will fetch selected expert slices through a bounded cache and serve n-gram rows through a separate page-aligned cache. Greedy output must match the pinned llama.cpp Qwen4Exp implementation.
 
-The current Unsloth `UD-IQ1_S` GGUF is 72.5 GB. About 39.8 GB belongs to routed experts and 28.8 GB to the n-gram table. Reading every selected expert without cache hits would move about 778 MB per generated token.
+## Artifact inspection
 
-## Initial design
-
-1. Keep dense weights, shared experts, recurrent state, and a modest context resident.
-2. Build an index of contiguous expert slices in the GGUF shards.
-3. Fetch only the selected gate, up, and down slices with asynchronous direct I/O.
-4. Use a bounded expert cache rather than the operating system page cache.
-5. Serve n-gram rows from SSD through a separate page-aligned row cache.
-6. Compare greedy output against the upstream llama.cpp Qwen4Exp implementation at every milestone.
-
-The first implementation should optimize correctness and memory accounting. Expert prediction, speculative reads, MTP, vision, and lossy expert dropping come later.
-
-## First target
-
-- Hardware: a 64 GB Apple Silicon Mac with fast internal NVMe
-- Model: `unsloth/Qwen3.8-Flash-Next-GGUF`
-- Mode: text-only, single sequence, short context during bring-up
-- Memory: enough headroom to avoid macOS compression and swap storms
-- Correctness: greedy token parity with a resident reference run
-- Performance: stable interactive decoding without relying on accidental `mmap` cache behavior
-
-See [docs/plan.md](docs/plan.md) for the bring-up sequence, [docs/validation.md](docs/validation.md) for the macOS smoke-test harness, and [docs/sources.md](docs/sources.md) for upstream work.
-
-## Artifact inspector
-
-The dependency-free Python inspector reads split GGUF metadata without mapping tensor bodies. It produces a tensor inventory, allocation ledger, and contiguous expert slices:
+The dependency-free inspector reads split GGUF metadata without mapping tensor bodies. It emits a tensor inventory, allocation ledger, and contiguous expert slices:
 
 ```sh
 python3 -m origami_artifacts /path/to/gguf/shards
 python3 -m origami_artifacts /path/to/gguf/shards --json --output ledger.json
 ```
 
-It rejects unsupported quantization and routed layouts. See [docs/artifact-inspector.md](docs/artifact-inspector.md) for allocation budgets, bounded span probes, and the current Qwen4Exp layout contract.
+`tools/gguf-map-audit.py` imports the same bounded parser and adds the pinned llama.cpp placement model. See [docs/artifact-inspector.md](docs/artifact-inspector.md), [docs/plan.md](docs/plan.md), and [docs/validation.md](docs/validation.md).

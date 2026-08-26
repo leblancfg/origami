@@ -101,6 +101,44 @@ Swapins: 7.
         self.assertEqual(sample["process_tree_rss_bytes"], 600 * 1024)
         self.assertEqual(sample["process_count"], 3)
 
+    def test_manifest_can_resolve_checked_in_manifest_from_model_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "model.gguf").write_bytes(b"1234")
+            manifest = {
+                "schema_version": VALIDATE.MANIFEST_VERSION,
+                "model": {"id": "test/model", "revision": "abc", "format": "GGUF", "quantization": "test"},
+                "entrypoint": "model.gguf",
+                "shards": [{"path": "model.gguf", "size_bytes": 4}],
+            }
+            manifest_path = root.parent / (root.name + "-manifest.json")
+            manifest_path.write_text(json.dumps(manifest))
+            try:
+                parsed, entrypoint = VALIDATE.validate_manifest(manifest_path, False, root)
+            finally:
+                manifest_path.unlink()
+            self.assertEqual(entrypoint, (root / "model.gguf").resolve())
+            self.assertEqual(parsed["total_actual_size_bytes"], 4)
+
+    def test_checked_in_model_manifest_matches_schema_contract_and_pins(self):
+        manifest = json.loads((ROOT / "config" / "qwen38-flash-next-ud-iq1_s.json").read_text())
+        self.assertEqual(set(manifest), {"schema_version", "model", "entrypoint", "shards"})
+        self.assertEqual(manifest["schema_version"], VALIDATE.MANIFEST_VERSION)
+        self.assertEqual(manifest["model"]["id"], "unsloth/Qwen3.8-Flash-Next-GGUF")
+        self.assertEqual(manifest["model"]["revision"], "d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249")
+        self.assertEqual(
+            [item["size_bytes"] for item in manifest["shards"]],
+            [10946624, 49990818368, 22544696352],
+        )
+        self.assertEqual(
+            [item["sha256"] for item in manifest["shards"]],
+            [
+                "88a1420825a9304063e882ada29d438263617f51ac8923d438d927496693bafd",
+                "3a62e35bbf9add4733bd1438ebd3a67649d5edd6cb0e72bb78e33c913992b2b6",
+                "0e25ceaeb89b8a80aa973c6c0c7448943682f7408c2855b2ebd016b7643a861a",
+            ],
+        )
+
     def test_manifest_rejects_partial_marker(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -133,6 +171,18 @@ class HarnessIntegrationTests(unittest.TestCase):
             *extra,
         ]
 
+    def test_preflight_only_does_not_start_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "preflight.json"
+            completed = subprocess.run(
+                self.command(output, "--preflight-only", "--", "--mock-exit-code", "9"),
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads(output.read_text())
+            self.assertEqual(result["status"], "pass")
+            self.assertNotIn("run", result)
+
     def test_mock_run_parsing_and_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -144,6 +194,8 @@ class HarnessIntegrationTests(unittest.TestCase):
                     output,
                     "--expected-output-sha256", "3b0c8ba590d96fdafce61f18ec139bcc6195dbf4bf69f22c3659448d43361c33",
                     "--verify-shards-sha256",
+                    "--profile", "first-token",
+                    "--lazy-mmap-safeguards",
                 ),
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 env=environment, timeout=20,
@@ -152,6 +204,8 @@ class HarnessIntegrationTests(unittest.TestCase):
             result = json.loads(output.read_text())
             self.assertEqual(result["status"], "pass")
             self.assertEqual(result["run"]["timings"]["prefill"]["tokens"], 10)
+            self.assertEqual(result["smoke_test"]["n_predict"], 1)
+            self.assertEqual(result["environment"], VALIDATE.SAFEGUARD_ENVIRONMENT)
             self.assertEqual(result["run"]["timings"]["decode"]["tokens"], 4)
             self.assertGreater(result["telemetry"]["summary"]["peak_process_tree_rss_bytes"], 0)
             self.assertTrue(result["model"]["shards"][0]["sha256_verified"])

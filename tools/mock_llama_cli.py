@@ -40,6 +40,10 @@ def main():
     time.sleep(max(0.0, args.mock_sleep))
     sys.stdout.buffer.write(OUTPUT)
     sys.stdout.buffer.flush()
+    if os.environ.get("LLAMA_MMAP_PREFETCH") == "0":
+        print("load_tensors: mmap prefetch disabled by LLAMA_MMAP_PREFETCH=0", file=sys.stderr)
+    if os.environ.get("GGML_METAL_NO_RESIDENCY") == "1":
+        print("ggml_metal_init: use residency sets    = false", file=sys.stderr)
     print("llama_perf_context_print:        load time =      25.00 ms", file=sys.stderr)
     print("llama_perf_context_print: prompt eval time =      80.00 ms /    10 tokens (    8.00 ms per token,   125.00 tokens per second)", file=sys.stderr)
     print("llama_perf_context_print:        eval time =     120.00 ms /     4 tokens (   30.00 ms per token,    33.33 tokens per second)", file=sys.stderr)

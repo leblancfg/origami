@@ -39,6 +39,10 @@
       "type": "array",
       "items": { "type": "string" }
     },
+    "environment": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
     "run": {
       "type": "object",
       "required": [

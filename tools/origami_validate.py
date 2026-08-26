@@ -25,6 +25,30 @@ N_PREDICT = 16
 SEED = 424242
 TEMPERATURE = 0
 MAX_CAPTURE_BYTES = 16 * 1024 * 1024
+PROFILES = {
+    "first-token": {
+        "name": "fixed-first-token-v1",
+        "prompt": "Hello",
+        "n_predict": 1,
+        "seed": SEED,
+        "temperature": TEMPERATURE,
+    },
+    "validation": {
+        "name": "fixed-greedy-sequence-v1",
+        "prompt": PROMPT,
+        "n_predict": N_PREDICT,
+        "seed": SEED,
+        "temperature": TEMPERATURE,
+    },
+}
+SAFEGUARD_ENVIRONMENT = {
+    "GGML_METAL_NO_RESIDENCY": "1",
+    "LLAMA_MMAP_PREFETCH": "0",
+}
+SAFEGUARD_LOG_MARKERS = (
+    "mmap prefetch disabled by LLAMA_MMAP_PREFETCH=0",
+    "use residency sets    = false",
+)
 
 COMMANDS = {
     "df": "/bin/df",
@@ -65,9 +89,11 @@ def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def command_environment() -> Dict[str, str]:
+def command_environment(overrides: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     environment = os.environ.copy()
     environment.update({"LANG": "C", "LC_ALL": "C"})
+    if overrides:
+        environment.update(overrides)
     return environment
 
 
@@ -105,7 +131,11 @@ def read_json(path: Path) -> Dict[str, Any]:
     return value
 
 
-def validate_manifest(path: Path, verify_hashes: bool) -> Tuple[Dict[str, Any], Path]:
+def validate_manifest(
+    path: Path,
+    verify_hashes: bool,
+    model_root: Optional[Path] = None,
+) -> Tuple[Dict[str, Any], Path]:
     manifest = read_json(path)
     unknown_root = sorted(set(manifest) - _MANIFEST_KEYS)
     if unknown_root:
@@ -132,7 +162,9 @@ def validate_manifest(path: Path, verify_hashes: bool) -> Tuple[Dict[str, Any], 
     if not isinstance(raw_shards, list) or not raw_shards:
         raise ValidationError("model manifest needs a non-empty shards array")
 
-    base = path.resolve().parent
+    base = model_root.expanduser().resolve() if model_root is not None else path.resolve().parent
+    if not base.is_dir():
+        raise ValidationError("model root is not a directory: " + str(base))
     statuses: List[Dict[str, Any]] = []
     errors: List[str] = []
     resolved_by_name: Dict[str, Path] = {}
@@ -544,7 +576,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--executable", required=True, type=Path, help="llama.cpp-compatible CLI")
     parser.add_argument("--runtime-revision", required=True, help="exact llama.cpp commit or build revision")
     parser.add_argument("--model-manifest", required=True, type=Path)
+    parser.add_argument(
+        "--model-root",
+        type=Path,
+        help="resolve manifest shard paths from this directory instead of the manifest directory",
+    )
     parser.add_argument("--output", required=True, type=Path, help="result JSON path")
+    parser.add_argument(
+        "--profile",
+        choices=sorted(PROFILES),
+        default="validation",
+        help="fixed deterministic smoke profile",
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="verify the executable and model shards without starting inference",
+    )
+    parser.add_argument(
+        "--lazy-mmap-safeguards",
+        action="store_true",
+        help="set both lazy-mmap safeguards and require their backend log markers",
+    )
     parser.add_argument("--expected-output-sha256", help="fail unless raw stdout has this SHA-256")
     parser.add_argument("--verify-shards-sha256", action="store_true", help="read and hash shards that declare sha256")
     parser.add_argument("--sample-interval", type=float, default=1.0, help="telemetry interval in seconds")
@@ -567,17 +620,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     started_at = utc_now()
     script_root = Path(__file__).resolve().parents[1]
+    profile = PROFILES[args.profile]
+    prompt = str(profile["prompt"])
+    n_predict = int(profile["n_predict"])
+    seed = int(profile["seed"])
+    temperature = int(profile["temperature"])
     result: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "status": "error",
         "started_at": started_at,
         "smoke_test": {
-            "name": "fixed-greedy-sequence-v1",
-            "prompt": PROMPT,
-            "prompt_sha256": PROMPT_SHA256,
-            "n_predict": N_PREDICT,
-            "seed": SEED,
-            "temperature": TEMPERATURE,
+            "name": profile["name"],
+            "prompt": prompt,
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "n_predict": n_predict,
+            "seed": seed,
+            "temperature": temperature,
         },
         "project": git_identity(script_root),
     }
@@ -601,7 +659,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise ValidationError("--expected-output-sha256 must be 64 hexadecimal characters")
 
         manifest_path = args.model_manifest.expanduser().resolve()
-        manifest, model_entrypoint = validate_manifest(manifest_path, args.verify_shards_sha256)
+        manifest, model_entrypoint = validate_manifest(
+            manifest_path,
+            args.verify_shards_sha256,
+            args.model_root,
+        )
         result["model"] = manifest["model"]
         result["model"].update({
             "manifest_path": str(manifest_path),
@@ -610,11 +672,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "total_actual_size_bytes": manifest["total_actual_size_bytes"],
             "shards": manifest["shard_status"],
         })
+        result["runtime"] = executable_identity(executable, args.runtime_revision.strip())
+        if args.preflight_only:
+            result["status"] = "pass"
+            exit_code = 0
+            return exit_code
+
         result["machine"] = collect_machine()
         result["model_storage"] = collect_storage(model_entrypoint)
         if result["model_storage"].get("internal") is not True or result["model_storage"].get("solid_state") is not True:
             raise ValidationError("the first PoC requires model shards on an internal solid-state volume")
-        result["runtime"] = executable_identity(executable, args.runtime_revision.strip())
 
         extra_args = list(args.extra_args)
         if extra_args and extra_args[0] == "--":
@@ -627,13 +694,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
         command = [str(executable)] + extra_args + [
             "--model", str(model_entrypoint),
-            "--prompt", PROMPT,
-            "--n-predict", str(N_PREDICT),
-            "--seed", str(SEED),
-            "--temp", str(TEMPERATURE),
+            "--prompt", prompt,
+            "--n-predict", str(n_predict),
+            "--seed", str(seed),
+            "--temp", str(temperature),
             "--no-display-prompt",
         ]
         result["command"] = command
+        runtime_environment = SAFEGUARD_ENVIRONMENT if args.lazy_mmap_safeguards else {}
+        result["environment"] = dict(runtime_environment)
 
         before = collect_system_snapshot()
         during: List[Dict[str, Any]] = []
@@ -647,7 +716,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 process = subprocess.Popen(
                     command, stdout=stdout_file, stderr=stderr_file,
                     start_new_session=True, stdin=subprocess.DEVNULL,
-                    env=command_environment(),
+                    env=command_environment(runtime_environment),
                 )
                 timeout_fired = threading.Event()
 
@@ -725,6 +794,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             failures.append("stdout SHA-256 does not match --expected-output-sha256")
         if not stdout_bytes:
             failures.append("runtime produced empty stdout")
+        if args.lazy_mmap_safeguards:
+            for marker in SAFEGUARD_LOG_MARKERS:
+                if marker not in stderr_text:
+                    failures.append("backend safeguard log marker was not found: " + marker)
         if failures:
             raise ValidationError("; ".join(failures))
 

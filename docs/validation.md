@@ -1,92 +1,79 @@
 # PoC validation harness
 
-`tools/origami_validate.py` runs one fixed greedy prompt through a llama.cpp-compatible CLI and writes a JSON record. It targets macOS because it reads `vm_stat`, `memory_pressure`, `vm.swapusage`, `ps`, and `diskutil`. Python's standard library is its only language dependency.
+`tools/origami_validate.py` runs deterministic llama.cpp profiles and writes one JSON record. It is the repository's only telemetry implementation. Python's standard library is its only language dependency.
 
-The harness does not inspect GGUF metadata or tensor data. The GGUF inventory tool owns that work. This harness checks artifact names, exact file sizes, split numbering, and partial-download markers before it starts inference.
+The harness targets macOS. It records `vm_stat`, `memory_pressure`, `vm.swapusage`, process-tree RSS, storage identity, runtime identity, stdout, stderr, and parsed llama.cpp timings. VM and swap counters are system-wide.
 
-## Model manifest
+## Integrated command
 
-Create a manifest beside the model shards. Record an immutable provider revision and copy exact byte sizes from the provider's artifact metadata. Relative paths are resolved from the manifest directory.
+The Qwen3.8 wrapper supplies every pinned argument:
 
-```json
-{
-  "schema_version": "origami.model-manifest.v1",
-  "model": {
-    "id": "unsloth/Qwen3.8-Flash-Next-GGUF",
-    "revision": "d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249",
-    "format": "GGUF",
-    "quantization": "UD-IQ1_S"
-  },
-  "entrypoint": "Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf",
-  "shards": [
-    {
-      "path": "Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf",
-      "size_bytes": 10946624
-    },
-    {
-      "path": "Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf",
-      "size_bytes": "<exact byte size from provider metadata>"
-    },
-    {
-      "path": "Qwen3.8-Flash-Next-UD-IQ1_S-00003-of-00003.gguf",
-      "size_bytes": "<exact byte size from provider metadata>"
-    }
-  ]
-}
+```sh
+scripts/smoke-test.sh --preflight-only /path/to/UD-IQ1_S
+scripts/smoke-test.sh /path/to/UD-IQ1_S
+scripts/smoke-test.sh --validation /path/to/UD-IQ1_S
 ```
 
-Replace the last two placeholders with integers. Do not use this example as an artifact manifest. `validation/model-manifest.schema.json` defines the format.
+The first-token profile generates one token. The validation profile uses the prompt `Reply with only the next four integers: 2 4 6 8` and generates at most 16 tokens. Both use seed 424242 and temperature 0. Pass `--output FILE` to select the result path.
 
-A shard fails preflight when it is missing, has the wrong size, or has a neighboring `.aria2` marker. Split names must share one prefix, cover every index from 1 through the declared shard count, and use shard 1 as the entrypoint. Canonical paths cannot alias the same file. Runtime validation enforces the schema's field types and rejects unknown root and shard fields. An optional `sha256` field pins content. Pass `--verify-shards-sha256` when a cold full-file read is acceptable; hashing a large model can change the filesystem cache state.
+The wrapper enables the lazy mmap safeguards. The harness records their values and fails unless stderr proves that mmap prefetch and Metal residency sets are disabled.
 
-## Fixed smoke test
+## Manifest checks
 
-The script owns these settings so benchmark commands cannot change them through extra arguments:
+`validation/model-manifest.schema.json` defines the model manifest. `config/qwen38-flash-next-ud-iq1_s.json` is the canonical manifest for this PoC. `--model-root` lets the harness resolve its relative shard paths from an external model directory.
 
-- prompt: `Reply with only the next four integers: 2 4 6 8`
-- prediction limit: 16 tokens
-- seed: 424242
-- temperature: 0 (greedy)
-- prompt display: disabled
+A shard fails preflight if it is missing, has the wrong size, or has a neighboring `.aria2` marker. Split names must share one prefix, include every declared index, and use shard 1 as the entrypoint. Canonical paths cannot alias one file. `--verify-shards-sha256` hashes shards that declare a digest; omit it before a cold-cache run if exact byte sizes are sufficient.
 
-The command places fixed flags after user-supplied flags and rejects extra arguments that repeat a fixed option or inject another `--` separator. It runs commands under the C locale so macOS telemetry and llama.cpp decimal output are parsed consistently. Raw stdout and its SHA-256 are stored in the result. Establish a golden hash with a trusted reference executable, then require it on later runs with `--expected-output-sha256`. A passing first run without that option records output but does not prove parity.
-
-Run the real CLI as follows:
+Preflight writes a normal result without starting inference:
 
 ```sh
 python3 tools/origami_validate.py \
   --executable /path/to/llama-cli \
   --runtime-revision LLAMA_CPP_COMMIT \
-  --model-manifest /path/to/model/model-manifest.json \
+  --model-manifest config/qwen38-flash-next-ud-iq1_s.json \
+  --model-root /path/to/UD-IQ1_S \
+  --output /tmp/origami-preflight.json \
+  --preflight-only
+```
+
+## Direct harness use
+
+Use the wrapper for the pinned PoC. Direct use is available for another llama.cpp-compatible executable:
+
+```sh
+python3 tools/origami_validate.py \
+  --executable /path/to/llama-cli \
+  --runtime-revision LLAMA_CPP_COMMIT \
+  --model-manifest /path/to/model-manifest.json \
   --output bench-results/smoke.json \
+  --profile validation \
   --expected-output-sha256 GOLDEN_SHA256 \
   -- --ctx-size 512 --threads 12
 ```
 
-The executable must accept the usual llama.cpp CLI flags and print llama.cpp performance lines on stderr. The first PoC also rejects a model volume that `diskutil` does not identify as internal solid-state storage. The parser recognizes both `llama_print_timings` and `llama_perf_context_print` prefixes. A run fails if prompt-evaluation or decode timing is absent.
+Extra arguments cannot replace the fixed model, prompt, prediction count, seed, temperature, or prompt-display options. The executable must print llama.cpp prefill and decode timings on stderr. The first PoC rejects storage that `diskutil` does not identify as internal solid state.
 
-## Captured data
+A trusted reference run can establish `--expected-output-sha256`. A passing run without that option records deterministic output but does not prove parity with an oracle.
 
-The JSON result includes:
+## Result and failure handling
 
-- Mac model, chip, CPU count, unified-memory size, macOS version, build, and kernel release
-- project commit and dirty state; runtime revision, version output, binary size, and binary SHA-256
-- provider model ID, immutable revision, quantization, shard status, and byte totals
-- model volume device, internal/solid-state flags, bus protocol, capacity, and free space
-- exact command, wall time, exit status, stdout, stderr, prefill timing, and decode timing
-- root-process and process-tree RSS samples
-- system snapshots before, during, and after the run
-- memory-pressure free percentage, compressor occupancy, compression counters, swap usage, and swap-in/swap-out counters
+`validation/result.schema.json` defines the result envelope. The harness records:
 
-The summary reports peak RSS, minimum free percentage, compressor growth, and swap growth. VM and swap counters are system-wide. Stop unrelated memory-heavy jobs before comparing runs, and retain the samples when a counter delta needs investigation.
+- project commit and dirty state
+- executable path, declared revision, version output, size, and SHA-256
+- immutable model identity, shard status, and byte totals
+- Mac, OS, memory, and storage properties
+- exact argv and safeguard environment
+- stdout, stderr, timings, and exit status
+- process-tree RSS and system memory snapshots
 
-`validation/result.schema.json` defines the result envelope. The script writes an error result on preflight and runtime failures. Exit status 2 means preflight or harness failure; status 3 means the child ran but validation failed; 130 means interruption. The output file is replaced atomically.
+Exit status 2 indicates preflight or harness failure. Status 3 means the child ran but validation failed; status 130 means interruption. The harness writes error results atomically.
 
-The harness starts the child in a new process group. RSS samples include both descendants and all members of that group, including children whose parent has exited. A watchdog enforces the runtime deadline independently of telemetry sampling. Timeout, interrupt, and normal leader-exit handling terminate the complete group, wait briefly, then kill remaining processes. Captures live in a temporary directory that Python removes on success and failure.
+The child runs in a new process group. Timeout, interruption, and ordinary leader exit terminate remaining group members. Captures are bounded and held in a temporary directory.
 
 ## Harmless self-test
 
-The repository includes a mock CLI and a 16-byte fixture. It loads no model.
+The mock CLI loads no GGUF tensor data:
 
 ```sh
 python3 tools/origami_validate.py \
@@ -100,5 +87,3 @@ python3 tools/origami_validate.py \
 
 python3 -m unittest discover -s tests -v
 ```
-
-The integration tests cover timing parsing, RSS sampling, shard rejection, output hashing, timeout termination, and capture cleanup.

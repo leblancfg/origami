@@ -1,3 +1,6 @@
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import struct
@@ -18,6 +21,12 @@ from origami_artifacts.gguf import (
 
 
 ALIGNMENT = 32
+ROOT = Path(__file__).resolve().parents[1]
+MAP_AUDIT_SPEC = importlib.util.spec_from_file_location(
+    "gguf_map_audit", ROOT / "tools" / "gguf-map-audit.py"
+)
+MAP_AUDIT = importlib.util.module_from_spec(MAP_AUDIT_SPEC)
+MAP_AUDIT_SPEC.loader.exec_module(MAP_AUDIT)
 
 
 def _string(value):
@@ -244,6 +253,15 @@ class ArtifactInspectorTests(unittest.TestCase):
         self.assertEqual(parse_size("0.5GiB"), 536_870_912)
         with self.assertRaises(GGUFError):
             parse_size("1G")
+
+    def test_map_audit_reuses_bounded_parser_and_reports_placement(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            totals = MAP_AUDIT.audit(self.tensor_path)
+        self.assertEqual(totals["CPU-input"], 450)
+        self.assertGreater(totals["Metal"], 0)
+        self.assertIn("PLE: IQ4_NL", output.getvalue())
+        self.assertIn("Metal envelope overlap", output.getvalue())
 
     def test_cli_emits_json(self):
         completed = subprocess.run(
