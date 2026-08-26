@@ -26,7 +26,9 @@ python3 -m origami_artifacts /path/to/UD-IQ1_S \
 
 `GB` uses powers of 1000. `GiB` uses powers of 1024. JSON records normalized integer byte counts so later C++ code does not need to reinterpret the input units.
 
-Inspection permits missing shards and truncated tensor bodies because metadata can arrive before weights. The report marks its scope as `present metadata shards only` and identifies unavailable spans. It does not present partial totals as full-artifact totals. If every declared shard is present, the inspector requires the parsed tensor count to match `split.tensors.count`.
+Inspection permits missing shards and truncated tensor bodies because metadata can arrive before weights. The report marks its scope as `present metadata shards only` and identifies unavailable spans. It does not present partial totals as full-artifact totals. A tensor-only subsidiary shard can infer the expert axis from routed tensors when the global metadata shard is absent. If every declared shard is present, the inspector requires the parsed tensor count to match `split.tensors.count`.
+
+Split keys must use llama.cpp's canonical types: `split.no` and `split.count` are `UINT16`; `split.tensors.count` is `INT32`. Tensor offsets must follow descriptor order exactly, with each tensor padded to `general.alignment`. Bounds checks include the final padding, signed 64-bit dimensions, element counts, byte spans, and ledger sums.
 
 ## Bounded span probe
 

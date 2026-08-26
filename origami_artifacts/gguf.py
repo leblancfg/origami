@@ -56,6 +56,27 @@ _VALUE_FORMATS: Dict[int, str] = {
     12: "d",  # FLOAT64
 }
 
+_EXPECTED_METADATA_TYPES = {
+    "general.alignment": 4,  # UINT32
+    "general.architecture": 8,  # STRING
+    "general.file_type": 4,
+    "general.name": 8,
+    "general.quantization_version": 4,
+    "general.type": 8,
+    "split.count": 2,  # UINT16 in llama.cpp's split writer and loader
+    "split.no": 2,
+    "split.tensors.count": 5,  # INT32
+    "qwen4exp.block_count": 4,
+    "qwen4exp.embedding_length": 4,
+    "qwen4exp.embedding_length_per_layer_input": 4,
+    "qwen4exp.expert_count": 4,
+    "qwen4exp.expert_feed_forward_length": 4,
+    "qwen4exp.expert_shared_feed_forward_length": 4,
+    "qwen4exp.expert_used_count": 4,
+    "qwen4exp.ple.head_vocab_sizes": 9,
+    "qwen4exp.ple.layers": 9,
+}
+
 _KEPT_METADATA = {
     "general.alignment",
     "general.architecture",
@@ -244,6 +265,12 @@ def parse_shard(
                 reader, value_type, keep, max_string_bytes, max_array_elements
             )
             if keep:
+                expected_type = _EXPECTED_METADATA_TYPES[key]
+                if value_type != expected_type:
+                    raise GGUFError(
+                        "%s: metadata key %s has type %d; expected %d"
+                        % (shard_path, key, value_type, expected_type)
+                    )
                 metadata[key] = value
 
         tensors: List[ParsedTensor] = []
@@ -261,9 +288,17 @@ def parse_shard(
                     % (shard_path, name, dimension_count)
                 )
             dimensions = reader.unpack("Q" * dimension_count)
-            if any(value == 0 for value in dimensions):
-                raise GGUFError("%s: tensor %s has a zero dimension" % (shard_path, name))
+            if any(value == 0 or value > (1 << 63) - 1 for value in dimensions):
+                raise GGUFError(
+                    "%s: tensor %s has a dimension outside signed 64-bit range"
+                    % (shard_path, name)
+                )
             type_code, relative_offset = reader.unpack("IQ")
+            if relative_offset > (1 << 63) - 1:
+                raise GGUFError(
+                    "%s: tensor %s offset exceeds signed 64-bit range"
+                    % (shard_path, name)
+                )
             tensors.append(
                 ParsedTensor(name, tuple(dimensions), type_code, relative_offset)
             )
@@ -302,12 +337,14 @@ def tensor_nbytes(dimensions: Sequence[int], type_code: int, name: str = "tensor
             "%s: first dimension %d is not divisible by %s block size %d"
             % (name, dimensions[0], quant.name, quant.block_elements)
         )
-    row_bytes = (dimensions[0] // quant.block_elements) * quant.block_bytes
-    size = row_bytes
-    for dimension in dimensions[1:]:
-        size *= dimension
-        if size > (1 << 63) - 1:
-            raise GGUFError("%s byte size overflows signed 64-bit range" % name)
+    element_count = 1
+    for dimension in dimensions:
+        if element_count > ((1 << 63) - 2) // dimension:
+            raise GGUFError("%s element count overflows signed 64-bit range" % name)
+        element_count *= dimension
+    size = (element_count // quant.block_elements) * quant.block_bytes
+    if size > (1 << 63) - 1:
+        raise GGUFError("%s byte size overflows signed 64-bit range" % name)
     return size
 
 
@@ -390,6 +427,14 @@ def inspect_artifact(
 ) -> Dict[str, Any]:
     """Inspect GGUF shards and return a JSON-serializable allocation ledger."""
 
+    for label, value in (
+        ("expert_cache_bytes", expert_cache_bytes),
+        ("ple_cache_bytes", ple_cache_bytes),
+        ("temporary_bytes", temporary_bytes),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0 or value > (1 << 63) - 1:
+            raise GGUFError("%s must be an integer in signed 64-bit range" % label)
+
     parsed = [
         parse_shard(path, max_metadata_bytes=max_metadata_bytes)
         for path in _resolve_paths(paths)
@@ -407,13 +452,13 @@ def inspect_artifact(
             raise GGUFError("split shards disagree on split.count or split.tensors.count")
         split_count = split_counts.pop()
         declared_tensor_count = declared_counts.pop()
-        if not isinstance(split_count, int) or split_count < 1:
+        if not isinstance(split_count, int) or isinstance(split_count, bool) or split_count < 1:
             raise GGUFError("invalid split.count %r" % split_count)
-        if not isinstance(declared_tensor_count, int) or declared_tensor_count < 0:
+        if not isinstance(declared_tensor_count, int) or isinstance(declared_tensor_count, bool) or declared_tensor_count < 0:
             raise GGUFError("invalid split.tensors.count %r" % declared_tensor_count)
         for shard in parsed:
             number = shard.metadata.get("split.no")
-            if not isinstance(number, int) or number < 0 or number >= split_count:
+            if not isinstance(number, int) or isinstance(number, bool) or number < 0 or number >= split_count:
                 raise GGUFError("%s: invalid split.no %r" % (shard.path, number))
             if number in shard_numbers:
                 raise GGUFError("duplicate split.no %d" % number)
@@ -466,24 +511,27 @@ def inspect_artifact(
         # aggregate value from the metadata shard before resolving offsets.
         data_offset = (shard.metadata_end + alignment - 1) & ~(alignment - 1)
         spans: List[Tuple[int, int, str]] = []
-        expected_min_size = data_offset
+        expected_relative_offset = 0
         available_count = 0
         for tensor in shard.tensors:
             if tensor.name in all_names:
                 raise GGUFError("duplicate tensor across shards: %s" % tensor.name)
             all_names.add(tensor.name)
-            if tensor.relative_offset % alignment:
+            if tensor.relative_offset != expected_relative_offset:
                 raise GGUFError(
-                    "%s: tensor %s offset %d is not %d-byte aligned"
-                    % (shard.path, tensor.name, tensor.relative_offset, alignment)
+                    "%s: tensor %s offset %d; expected contiguous GGUF offset %d"
+                    % (shard.path, tensor.name, tensor.relative_offset, expected_relative_offset)
                 )
             byte_length = tensor_nbytes(tensor.dimensions, tensor.type_code, tensor.name)
+            padded_length = (byte_length + alignment - 1) & ~(alignment - 1)
+            if expected_relative_offset > (1 << 63) - 1 - padded_length:
+                raise GGUFError("tensor %s padded span overflows signed 64-bit range" % tensor.name)
+            expected_relative_offset += padded_length
             start = data_offset + tensor.relative_offset
             end = start + byte_length
             if end > (1 << 63) - 1:
                 raise GGUFError("tensor %s span overflows signed 64-bit range" % tensor.name)
             spans.append((start, end, tensor.name))
-            expected_min_size = max(expected_min_size, end)
             available = end <= shard.file_size
             available_count += int(available)
             category, routed_key = _classify(tensor.name)
@@ -506,9 +554,21 @@ def inspect_artifact(
 
             if routed_key is not None:
                 layer, projection = routed_key
-                if not isinstance(expert_count, int) or expert_count <= 0:
+                if len(tensor.dimensions) != 3:
+                    raise GGUFError(
+                        "%s: only [input, output, expert] routed layout is supported"
+                        % tensor.name
+                    )
+                if isinstance(expert_count, int) and not isinstance(expert_count, bool) and expert_count > 0:
+                    tensor_expert_count = expert_count
+                elif not complete:
+                    # Global architecture metadata normally lives only in split 0.
+                    # A subsidiary shard can still establish its contiguous expert
+                    # axis from the routed tensor's third dimension.
+                    tensor_expert_count = tensor.dimensions[2]
+                else:
                     raise GGUFError("%s: routed layout requires qwen4exp.expert_count" % tensor.name)
-                if len(tensor.dimensions) != 3 or tensor.dimensions[2] != expert_count:
+                if tensor.dimensions[2] != tensor_expert_count:
                     raise GGUFError(
                         "%s: only [input, output, expert] routed layout is supported"
                         % tensor.name
@@ -526,12 +586,12 @@ def inspect_artifact(
                             "%s: dimensions %r do not match expected current layout %r"
                             % (tensor.name, tensor.dimensions, expected_dims)
                         )
-                if byte_length % expert_count:
+                if byte_length % tensor_expert_count:
                     raise GGUFError("%s: bytes do not divide evenly by expert" % tensor.name)
-                slice_length = byte_length // expert_count
+                slice_length = byte_length // tensor_expert_count
                 routed_inventory.add((layer, projection))
                 if include_slices:
-                    for expert in range(expert_count):
+                    for expert in range(tensor_expert_count):
                         slice_start = start + expert * slice_length
                         slices.append(
                             {
@@ -553,6 +613,9 @@ def inspect_artifact(
                     "%s: tensor spans overlap (%s and %s)"
                     % (shard.path, previous[2], current[2])
                 )
+        expected_min_size = data_offset + expected_relative_offset
+        if expected_min_size > (1 << 63) - 1:
+            raise GGUFError("%s: padded data section overflows signed 64-bit range" % shard.path)
         shard_reports.append(
             {
                 "number": shard_number,
@@ -587,11 +650,24 @@ def inspect_artifact(
         ):
             raise GGUFError("qwen4exp declares PLE layers but has no supported PLE tensor")
 
-    logical_tensor_bytes = sum(totals.values())
-    resident = totals["dense"] + totals["shared"]
-    streamed = totals["routed"] + totals["ple"]
-    cache = expert_cache_bytes + ple_cache_bytes
-    runtime_accounted = resident + cache + temporary_bytes
+    signed_max = (1 << 63) - 1
+
+    def checked_sum(label: str, values: Iterable[int]) -> int:
+        result = sum(values)
+        if result > signed_max:
+            raise GGUFError("%s overflows signed 64-bit range" % label)
+        return result
+
+    for category, total in totals.items():
+        if total > signed_max:
+            raise GGUFError("%s tensor total overflows signed 64-bit range" % category)
+    logical_tensor_bytes = checked_sum("logical tensor bytes", totals.values())
+    resident = checked_sum("resident weight bytes", (totals["dense"], totals["shared"]))
+    streamed = checked_sum("streamed weight bytes", (totals["routed"], totals["ple"]))
+    cache = checked_sum("cache budget", (expert_cache_bytes, ple_cache_bytes))
+    runtime_accounted = checked_sum(
+        "runtime accounted bytes", (resident, cache, temporary_bytes)
+    )
     allocations = [
         {"name": "dense_weights", "kind": "resident", "bytes": totals["dense"]},
         {"name": "shared_experts", "kind": "resident", "bytes": totals["shared"]},

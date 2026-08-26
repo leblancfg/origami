@@ -50,7 +50,10 @@ def write_gguf(path, metadata, tensors, include_body=True):
     if include_body and tensors:
         body_size = max(
             tensor["offset"]
-            + tensor_nbytes(tensor["dimensions"], tensor["type"], tensor["name"])
+            + (
+                tensor_nbytes(tensor["dimensions"], tensor["type"], tensor["name"])
+                + ALIGNMENT - 1
+            ) // ALIGNMENT * ALIGNMENT
             for tensor in tensors
         )
         content += bytes((index % 251) + 1 for index in range(body_size))
@@ -60,7 +63,7 @@ def write_gguf(path, metadata, tensors, include_body=True):
 def fixture_metadata(shard_number, tensor_count=6):
     values = [
         ("split.no", (2, shard_number)),
-        ("split.tensors.count", (10, tensor_count)),
+        ("split.tensors.count", (5, tensor_count)),
         ("split.count", (2, 2)),
     ]
     if shard_number == 0:
@@ -147,8 +150,11 @@ class ArtifactInspectorTests(unittest.TestCase):
         self.assertEqual(result["span"][1] - result["span"][0], 3200)
 
     def test_truncated_body_is_reported_and_probe_fails_closed(self):
+        last = fixture_tensors()[-1]
+        last_length = tensor_nbytes(last["dimensions"], last["type"], last["name"])
+        trailing_padding = (-last_length) % ALIGNMENT
         with self.tensor_path.open("r+b") as handle:
-            handle.truncate(self.tensor_path.stat().st_size - 1)
+            handle.truncate(self.tensor_path.stat().st_size - trailing_padding - 1)
         report = inspect_artifact([self.directory])
         self.assertFalse(report["shards"][1]["body_complete"])
         with self.assertRaisesRegex(GGUFError, "exceeds shard size"):
@@ -179,10 +185,57 @@ class ArtifactInspectorTests(unittest.TestCase):
         overlapping = fixture_tensors()
         overlapping[1] = dict(overlapping[1], offset=overlapping[0]["offset"])
         write_gguf(self.tensor_path, fixture_metadata(1), overlapping)
-        with self.assertRaisesRegex(GGUFError, "overlap"):
+        with self.assertRaisesRegex(GGUFError, "expected contiguous GGUF offset"):
             inspect_artifact([self.directory])
         with self.assertRaisesRegex(GGUFError, "read limit"):
             parse_shard(self.metadata_path, max_metadata_bytes=16)
+
+    def test_quantized_block_sizes_match_current_ggml_traits(self):
+        expected = {
+            0: (1, 4),
+            8: (32, 34),
+            12: (256, 144),
+            13: (256, 176),
+            14: (256, 210),
+            16: (256, 66),
+            19: (256, 50),
+            20: (32, 18),
+            30: (1, 2),
+        }
+        for type_code, (elements, byte_count) in expected.items():
+            with self.subTest(type_code=type_code):
+                self.assertEqual(tensor_nbytes((elements,), type_code), byte_count)
+                self.assertEqual(tensor_nbytes((elements, 3), type_code), 3 * byte_count)
+
+    def test_rejects_noncanonical_split_types_offsets_and_overflow(self):
+        wrong_type = fixture_metadata(1)
+        wrong_type[1] = ("split.tensors.count", (10, 6))
+        write_gguf(self.tensor_path, wrong_type, fixture_tensors())
+        with self.assertRaisesRegex(GGUFError, "split.tensors.count has type 10; expected 5"):
+            inspect_artifact([self.directory])
+
+        write_gguf(self.tensor_path, fixture_metadata(1), fixture_tensors())
+        malformed = fixture_tensors()
+        malformed[1] = dict(malformed[1], offset=malformed[1]["offset"] + ALIGNMENT)
+        write_gguf(self.tensor_path, fixture_metadata(1), malformed, include_body=False)
+        with self.assertRaisesRegex(GGUFError, "expected contiguous GGUF offset"):
+            inspect_artifact([self.directory])
+
+        with self.assertRaisesRegex(GGUFError, "element count overflows"):
+            tensor_nbytes(((1 << 63) - 1,), 0, "huge")
+        with self.assertRaisesRegex(GGUFError, "cache budget overflows"):
+            inspect_artifact(
+                [self.metadata_path],
+                expert_cache_bytes=(1 << 63) - 1,
+                ple_cache_bytes=1,
+            )
+
+    def test_partial_tensor_shard_infers_expert_axis(self):
+        report = inspect_artifact([self.tensor_path])
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["split"]["missing"], [0])
+        self.assertEqual(report["inventory"]["expert_slice_count"], 6)
+        self.assertEqual({item["expert"] for item in report["expert_slices"]}, {0, 1})
 
     def test_decimal_gb_and_binary_gib_are_distinct(self):
         self.assertEqual(parse_size("1GB"), 1_000_000_000)

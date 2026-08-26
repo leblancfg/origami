@@ -37,7 +37,7 @@ Create a manifest beside the model shards. Record an immutable provider revision
 
 Replace the last two placeholders with integers. Do not use this example as an artifact manifest. `validation/model-manifest.schema.json` defines the format.
 
-A shard fails preflight when it is missing, has the wrong size, or has a neighboring `.aria2` marker. Split names must cover every index from 1 through the declared shard count. An optional `sha256` field pins content. Pass `--verify-shards-sha256` when a cold full-file read is acceptable; hashing a large model can change the filesystem cache state.
+A shard fails preflight when it is missing, has the wrong size, or has a neighboring `.aria2` marker. Split names must share one prefix, cover every index from 1 through the declared shard count, and use shard 1 as the entrypoint. Canonical paths cannot alias the same file. Runtime validation enforces the schema's field types and rejects unknown root and shard fields. An optional `sha256` field pins content. Pass `--verify-shards-sha256` when a cold full-file read is acceptable; hashing a large model can change the filesystem cache state.
 
 ## Fixed smoke test
 
@@ -49,7 +49,7 @@ The script owns these settings so benchmark commands cannot change them through 
 - temperature: 0 (greedy)
 - prompt display: disabled
 
-The command places fixed flags after user-supplied flags. Raw stdout and its SHA-256 are stored in the result. Establish a golden hash with a trusted reference executable, then require it on later runs with `--expected-output-sha256`. A passing first run without that option records output but does not prove parity.
+The command places fixed flags after user-supplied flags and rejects extra arguments that repeat a fixed option or inject another `--` separator. It runs commands under the C locale so macOS telemetry and llama.cpp decimal output are parsed consistently. Raw stdout and its SHA-256 are stored in the result. Establish a golden hash with a trusted reference executable, then require it on later runs with `--expected-output-sha256`. A passing first run without that option records output but does not prove parity.
 
 Run the real CLI as follows:
 
@@ -82,7 +82,7 @@ The summary reports peak RSS, minimum free percentage, compressor growth, and sw
 
 `validation/result.schema.json` defines the result envelope. The script writes an error result on preflight and runtime failures. Exit status 2 means preflight or harness failure; status 3 means the child ran but validation failed; 130 means interruption. The output file is replaced atomically.
 
-The harness starts the child in a new process group. Timeout and interrupt handling terminate that group, wait briefly, then kill remaining processes. Captures live in a temporary directory that Python removes on success and failure.
+The harness starts the child in a new process group. RSS samples include both descendants and all members of that group, including children whose parent has exited. A watchdog enforces the runtime deadline independently of telemetry sampling. Timeout, interrupt, and normal leader-exit handling terminate the complete group, wait briefly, then kill remaining processes. Captures live in a temporary directory that Python removes on success and failure.
 
 ## Harmless self-test
 

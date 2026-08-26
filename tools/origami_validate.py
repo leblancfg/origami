@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -44,6 +45,12 @@ TIMING_RE = re.compile(
     re.IGNORECASE,
 )
 SPLIT_RE = re.compile(r"-(?P<index>[0-9]{5})-of-(?P<count>[0-9]{5})\.gguf$")
+_MANIFEST_KEYS = {"schema_version", "model", "entrypoint", "shards"}
+_SHARD_KEYS = {"path", "size_bytes", "sha256"}
+_FIXED_RUNTIME_OPTIONS = {
+    "-m", "--model", "-p", "--prompt", "-n", "--n-predict", "-s", "--seed",
+    "--temp", "--temperature", "--no-display-prompt",
+}
 
 
 class ValidationError(Exception):
@@ -58,10 +65,17 @@ def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def command_environment() -> Dict[str, str]:
+    environment = os.environ.copy()
+    environment.update({"LANG": "C", "LC_ALL": "C"})
+    return environment
+
+
 def run_command(command: Sequence[str], timeout: float = 10.0) -> subprocess.CompletedProcess:
     return subprocess.run(
         list(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, timeout=timeout, check=False,
+        text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False,
+        env=command_environment(),
     )
 
 
@@ -93,6 +107,9 @@ def read_json(path: Path) -> Dict[str, Any]:
 
 def validate_manifest(path: Path, verify_hashes: bool) -> Tuple[Dict[str, Any], Path]:
     manifest = read_json(path)
+    unknown_root = sorted(set(manifest) - _MANIFEST_KEYS)
+    if unknown_root:
+        raise ValidationError("unknown model manifest fields: " + ", ".join(unknown_root))
     if manifest.get("schema_version") != MANIFEST_VERSION:
         raise ValidationError("model manifest schema_version must be " + MANIFEST_VERSION)
 
@@ -100,11 +117,16 @@ def validate_manifest(path: Path, verify_hashes: bool) -> Tuple[Dict[str, Any], 
     if not isinstance(model, dict):
         raise ValidationError("model manifest needs a model object")
     required_identity = ("id", "revision", "format", "quantization")
-    missing_identity = [key for key in required_identity if not model.get(key)]
-    if missing_identity:
-        raise ValidationError("model identity is missing: " + ", ".join(missing_identity))
-    if str(model["format"]).upper() != "GGUF":
-        raise ValidationError("first PoC manifest format must be GGUF")
+    invalid_identity = [
+        key for key in required_identity
+        if not isinstance(model.get(key), str) or not model[key]
+    ]
+    if invalid_identity:
+        raise ValidationError(
+            "model identity fields must be non-empty strings: " + ", ".join(invalid_identity)
+        )
+    if model["format"] != "GGUF":
+        raise ValidationError("first PoC manifest format must be exactly GGUF")
 
     raw_shards = manifest.get("shards")
     if not isinstance(raw_shards, list) or not raw_shards:
@@ -114,12 +136,18 @@ def validate_manifest(path: Path, verify_hashes: bool) -> Tuple[Dict[str, Any], 
     statuses: List[Dict[str, Any]] = []
     errors: List[str] = []
     resolved_by_name: Dict[str, Path] = {}
-    split_parts: List[Tuple[int, int, str]] = []
+    resolved_paths = set()
+    split_parts: List[Tuple[int, int, str, str]] = []
 
     for position, shard in enumerate(raw_shards):
         if not isinstance(shard, dict):
             errors.append("shards[{}] is not an object".format(position))
             continue
+        unknown_shard = sorted(set(shard) - _SHARD_KEYS)
+        if unknown_shard:
+            errors.append(
+                "shards[{}] has unknown fields: {}".format(position, ", ".join(unknown_shard))
+            )
         relative = shard.get("path")
         expected_size = shard.get("size_bytes")
         if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
@@ -134,10 +162,19 @@ def validate_manifest(path: Path, verify_hashes: bool) -> Tuple[Dict[str, Any], 
         except ValueError:
             errors.append("{}: path escapes the manifest directory".format(relative))
             continue
-        if relative in resolved_by_name:
+        if relative in resolved_by_name or resolved in resolved_paths:
             errors.append("{}: duplicate shard path".format(relative))
             continue
         resolved_by_name[relative] = resolved
+        resolved_paths.add(resolved)
+
+        expected_hash = shard.get("sha256")
+        valid_hash = expected_hash is None or (
+            isinstance(expected_hash, str)
+            and re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash) is not None
+        )
+        if not valid_hash:
+            errors.append("{}: sha256 must be 64 hexadecimal characters".format(relative))
 
         status: Dict[str, Any] = {
             "path": relative,
@@ -160,33 +197,34 @@ def validate_manifest(path: Path, verify_hashes: bool) -> Tuple[Dict[str, Any], 
                 )
             if partial_marker.exists():
                 errors.append("{}: partial-download marker exists: {}".format(relative, partial_marker.name))
-            expected_hash = shard.get("sha256")
-            if expected_hash is not None:
-                if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
-                    errors.append("{}: sha256 must be 64 hexadecimal characters".format(relative))
-                else:
-                    status["expected_sha256"] = expected_hash.lower()
-                    status["sha256_verified"] = False
-                    if verify_hashes and actual_size == expected_size and not partial_marker.exists():
-                        actual_hash = sha256_file(resolved)
-                        status["actual_sha256"] = actual_hash
-                        status["sha256_verified"] = True
-                        if actual_hash != expected_hash.lower():
-                            errors.append("{}: sha256 mismatch".format(relative))
+            if expected_hash is not None and valid_hash:
+                status["expected_sha256"] = expected_hash.lower()
+                status["sha256_verified"] = False
+                if verify_hashes and actual_size == expected_size and not partial_marker.exists():
+                    actual_hash = sha256_file(resolved)
+                    status["actual_sha256"] = actual_hash
+                    status["sha256_verified"] = True
+                    if actual_hash != expected_hash.lower():
+                        errors.append("{}: sha256 mismatch".format(relative))
             status["complete"] = actual_size == expected_size and not partial_marker.exists()
         statuses.append(status)
 
         match = SPLIT_RE.search(relative)
         if match:
-            split_parts.append((int(match.group("index")), int(match.group("count")), relative))
+            split_parts.append(
+                (int(match.group("index")), int(match.group("count")), relative, relative[:match.start()])
+            )
 
+    if len(raw_shards) > 1 and not split_parts:
+        errors.append("multi-file GGUF shard names must use -00001-of-000NN numbering")
     if split_parts:
-        counts = {count for _, count, _ in split_parts}
-        if len(split_parts) != len(raw_shards) or len(counts) != 1:
+        counts = {count for _, count, _, _ in split_parts}
+        prefixes = {prefix for _, _, _, prefix in split_parts}
+        if len(split_parts) != len(raw_shards) or len(counts) != 1 or len(prefixes) != 1:
             errors.append("split GGUF shard names are inconsistent")
         else:
             count = next(iter(counts))
-            indices = {index for index, _, _ in split_parts}
+            indices = {index for index, _, _, _ in split_parts}
             expected_indices = set(range(1, count + 1))
             if indices != expected_indices or len(raw_shards) != count:
                 errors.append(
@@ -201,6 +239,9 @@ def validate_manifest(path: Path, verify_hashes: bool) -> Tuple[Dict[str, Any], 
         entrypoint_path = base
     else:
         entrypoint_path = resolved_by_name[entrypoint]
+        entrypoint_match = SPLIT_RE.search(entrypoint)
+        if split_parts and (entrypoint_match is None or int(entrypoint_match.group("index")) != 1):
+            errors.append("entrypoint must be the first split shard (index 00001)")
 
     manifest["shard_status"] = statuses
     manifest["total_expected_size_bytes"] = sum(
@@ -264,7 +305,7 @@ def collect_storage(path: Path) -> Dict[str, Any]:
     device = result.stdout.splitlines()[-1].split()[0]
     raw = subprocess.run(
         [COMMANDS["diskutil"], "info", "-plist", device], stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, timeout=10, check=False,
+        stderr=subprocess.PIPE, timeout=10, check=False, env=command_environment(),
     )
     if raw.returncode != 0:
         raise ValidationError(
@@ -349,29 +390,36 @@ def collect_system_snapshot(elapsed_seconds: Optional[float] = None) -> Dict[str
 
 
 def process_tree_rss(root_pid: int) -> Dict[str, Any]:
-    result = run_command([COMMANDS["ps"], "-axo", "pid=,ppid=,rss="])
+    result = run_command([COMMANDS["ps"], "-axo", "pid=,ppid=,pgid=,rss="])
     if result.returncode != 0:
         raise ValidationError("ps failed while sampling RSS: " + result.stderr.strip())
-    rows: Dict[int, Tuple[int, int]] = {}
+    rows: Dict[int, Tuple[int, int, int]] = {}
     for line in result.stdout.splitlines():
         fields = line.split()
-        if len(fields) == 3:
+        if len(fields) == 4:
             try:
-                rows[int(fields[0])] = (int(fields[1]), int(fields[2]) * 1024)
+                rows[int(fields[0])] = (
+                    int(fields[1]), int(fields[2]), int(fields[3]) * 1024
+                )
             except ValueError:
                 pass
     descendants = {root_pid}
     changed = True
     while changed:
         changed = False
-        for pid, (ppid, _) in rows.items():
+        for pid, (ppid, _, _) in rows.items():
             if ppid in descendants and pid not in descendants:
                 descendants.add(pid)
                 changed = True
-    present = sorted(pid for pid in descendants if pid in rows)
+    # start_new_session=True makes root_pid the process-group ID. Group
+    # membership keeps a child attributable after its immediate parent exits.
+    members = descendants | {
+        pid for pid, (_, pgid, _) in rows.items() if pgid == root_pid
+    }
+    present = sorted(pid for pid in members if pid in rows)
     return {
-        "root_rss_bytes": rows.get(root_pid, (0, 0))[1],
-        "process_tree_rss_bytes": sum(rows[pid][1] for pid in present),
+        "root_rss_bytes": rows.get(root_pid, (0, 0, 0))[2],
+        "process_tree_rss_bytes": sum(rows[pid][2] for pid in present),
         "process_count": len(present),
     }
 
@@ -425,23 +473,38 @@ def executable_identity(path: Path, supplied_revision: str) -> Dict[str, Any]:
     }
 
 
-def terminate_process_group(process: subprocess.Popen, grace_seconds: float = 2.0) -> None:
-    if process.poll() is not None:
-        return
+def process_group_exists(pgid: int) -> bool:
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(pgid, 0)
+        return True
     except ProcessLookupError:
-        return
+        return False
+    except PermissionError:
+        return True
+
+
+def terminate_process_group(process: subprocess.Popen, grace_seconds: float = 2.0) -> None:
+    # The group can outlive its leader. Never return merely because Popen.poll()
+    # says the root exited.
+    if process_group_exists(process.pid):
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + grace_seconds
+        while process_group_exists(process.pid) and time.monotonic() < deadline:
+            process.poll()  # reap the group leader so it does not look alive as a zombie
+            time.sleep(0.02)
+        if process_group_exists(process.pid):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
     try:
         process.wait(timeout=grace_seconds)
-        return
     except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
+        process.kill()
+        process.wait()
 
 
 def read_capture(path: Path) -> Tuple[bytes, bool]:
@@ -556,6 +619,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         extra_args = list(args.extra_args)
         if extra_args and extra_args[0] == "--":
             extra_args = extra_args[1:]
+        for item in extra_args:
+            option = item.split("=", 1)[0]
+            if item == "--" or option in _FIXED_RUNTIME_OPTIONS:
+                raise ValidationError(
+                    "extra arguments cannot override fixed runtime option: " + item
+                )
         command = [str(executable)] + extra_args + [
             "--model", str(model_entrypoint),
             "--prompt", PROMPT,
@@ -578,14 +647,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 process = subprocess.Popen(
                     command, stdout=stdout_file, stderr=stderr_file,
                     start_new_session=True, stdin=subprocess.DEVNULL,
+                    env=command_environment(),
                 )
+                timeout_fired = threading.Event()
+
+                def enforce_timeout() -> None:
+                    if process.poll() is None:
+                        timeout_fired.set()
+                        terminate_process_group(process)
+
+                watchdog = threading.Timer(args.timeout, enforce_timeout)
+                watchdog.daemon = True
+                watchdog.start()
                 try:
                     while process.poll() is None:
                         elapsed = time.monotonic() - wall_start
-                        if elapsed >= args.timeout:
-                            timed_out = True
-                            terminate_process_group(process)
-                            break
                         rss_item = process_tree_rss(process.pid)
                         rss_item["elapsed_seconds"] = round(elapsed, 6)
                         rss_samples.append(rss_item)
@@ -593,12 +669,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         remaining = args.sample_interval - (time.monotonic() - wall_start - elapsed)
                         if remaining > 0:
                             try:
-                                process.wait(timeout=min(remaining, max(0.0, args.timeout - (time.monotonic() - wall_start))))
+                                process.wait(timeout=remaining)
                             except subprocess.TimeoutExpired:
                                 pass
+                    timed_out = timeout_fired.is_set()
+                    # A successful or failed leader must not leave capture-writing
+                    # descendants behind in its session's process group.
+                    terminate_process_group(process)
                 except BaseException:
                     terminate_process_group(process)
                     raise
+                finally:
+                    watchdog.cancel()
+                    watchdog.join()
                 returncode = process.wait()
             stdout_bytes, stdout_truncated = read_capture(stdout_path)
             stderr_bytes, stderr_truncated = read_capture(stderr_path)
