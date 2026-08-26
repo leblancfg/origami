@@ -1,3 +1,16 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 19c57820e..87b13bfae 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1175,4 +1175,8 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
+             dev->props.use_residency_sets = true;
+ #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
+             dev->props.use_residency_sets = getenv("GGML_METAL_NO_RESIDENCY") == nil;
++            if (!dev->props.use_residency_sets) {
++                fprintf(stderr, "%s: use residency sets    = false (GGML_METAL_NO_RESIDENCY=1)\n", __func__);
++                fflush(stderr);
++            }
+ #endif
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 index 1b058d82b..887aa5a76 100644
 --- a/src/llama-model.cpp

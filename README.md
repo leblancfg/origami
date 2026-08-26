@@ -18,11 +18,14 @@ scripts/smoke-test.sh /path/to/UD-IQ1_S
 
 # Run the fixed 16-token validation profile.
 scripts/smoke-test.sh --validation /path/to/UD-IQ1_S
+
+# Reproduce the unsafe full-Metal placement failure when diagnosing it.
+scripts/smoke-test.sh --full-metal-output /path/to/UD-IQ1_S
 ```
 
 `tools/origami_validate.py` is the only telemetry implementation. `scripts/smoke-test.sh` supplies the pinned executable, manifest, runtime profile, and both required environment safeguards. The JSON result captures the command, backend log, host identity, process RSS, memory pressure, compression, and swap counters.
 
-The default run sets `GGML_METAL_NO_RESIDENCY=1` and `LLAMA_MMAP_PREFETCH=0`. A pass requires backend log lines proving that residency sets and mmap prefetch are disabled. This mmap path has no cache ceiling, so its memory use is not bounded. See [docs/poc.md](docs/poc.md) for the exact identities, expected log evidence, and Metal-envelope fallback.
+The default 64 GB run sets `GGML_METAL_NO_RESIDENCY=1` and `LLAMA_MMAP_PREFETCH=0`, enables performance logs, and places the output tensor on CPU. The CPU placement avoids the 46.6 GiB Metal mmap envelope that caused an out-of-memory command-buffer failure and 6.72 GB of swap growth in the first full-Metal run. A pass requires backend log lines proving that residency sets and mmap prefetch are disabled. This mmap path has no cache ceiling, so its memory use is not bounded. See [docs/poc.md](docs/poc.md) and [the measured result](docs/results/qwen38-poc-m2-max.md).
 
 ## Working hypothesis
 

@@ -25,6 +25,15 @@ llama_perf_context_print: eval time = 120.00 ms / 4 tokens (30.00 ms per token, 
         self.assertEqual(parsed["prefill"]["tokens"], 10)
         self.assertEqual(parsed["decode"]["elapsed_ms"], 120.0)
 
+    def test_extract_generated_output_and_backend_failures(self):
+        stdout = "banner\n\n> Hello\n\n[Start thinking]\n\nThe\n\n[ Prompt: 66.7 t/s ]\n"
+        self.assertEqual(VALIDATE.extract_generated_output(stdout, "Hello"), "The")
+        self.assertEqual(VALIDATE.extract_generated_output("plain output\n", "Hello"), "plain output\n")
+        self.assertEqual(
+            VALIDATE.find_runtime_failures("Error: Compute error.\n", "Insufficient Memory\n"),
+            ["Error: Compute error.", "Insufficient Memory"],
+        )
+
     def test_parse_vm_and_swap(self):
         vm = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
 Pages free: 10.
@@ -207,6 +216,7 @@ class HarnessIntegrationTests(unittest.TestCase):
             self.assertEqual(result["smoke_test"]["n_predict"], 1)
             self.assertEqual(result["environment"], VALIDATE.SAFEGUARD_ENVIRONMENT)
             self.assertEqual(result["run"]["timings"]["decode"]["tokens"], 4)
+            self.assertEqual(result["run"]["generated_output"], "10 12 14 16\n")
             self.assertGreater(result["telemetry"]["summary"]["peak_process_tree_rss_bytes"], 0)
             self.assertTrue(result["model"]["shards"][0]["sha256_verified"])
             self.assertEqual(list(root.glob("origami-validation-*")), [])

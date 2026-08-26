@@ -24,7 +24,7 @@ The script creates `/private/tmp/origami-deps/llama.cpp-bea3b12daee45876b0129a36
 
 1. Fetch and detach at the full pinned revision.
 2. Verify `HEAD`, apply the mmap patch idempotently, and verify that `HEAD` is unchanged.
-3. Reject patched changes outside `src/llama-model.cpp`.
+3. Reject patched changes outside `src/llama-model.cpp` and `ggml/src/ggml-metal/ggml-metal-device.m`. The Metal change only emits the safeguard state before CLI logging is configured.
 4. Build `llama-cli`, `test-llama-archs`, and `test-backend-ops`.
 5. check every PoC CLI option against the built binary's `--help` output.
 
@@ -50,7 +50,7 @@ It uses a 512-token context, batch and microbatch sizes of 32, greedy sampling, 
 scripts/smoke-test.sh --validation /path/to/UD-IQ1_S
 ```
 
-Both commands run through `tools/origami_validate.py`; no shell telemetry loop remains. Results are written under `artifacts/` unless `--output FILE` is supplied.
+Both commands run through `tools/origami_validate.py`; no shell telemetry loop remains. The 64 GB profile adds `--override-tensor '^output=CPU'`, `--log-verbosity 4`, and `--perf`. Results are written under `artifacts/` unless `--output FILE` is supplied.
 
 ## Lazy mmap safeguards
 
@@ -68,15 +68,17 @@ mmap prefetch disabled by LLAMA_MMAP_PREFETCH=0
 use residency sets    = false
 ```
 
-The patch changes only the initial mmap advice. The existing Metal variable prevents residency-set requests. Neither safeguard bounds the Darwin file cache, compressor use, or physical pages retained by the OS. Treat this as a memory-fit reference, not Origami's bounded expert-streaming design.
+The patch changes the initial mmap advice and adds an unconditional diagnostic when Metal observes the residency opt-out. The existing Metal variable prevents residency-set requests. Neither safeguard bounds the Darwin file cache, compressor use, or physical pages retained by the OS. Treat this as a memory-fit reference, not Origami's bounded expert-streaming design.
 
-Qwen4Exp already classifies `per_layer_token_embd.weight` as a CPU input tensor. The launch profile therefore has no tensor override for PLE. If Metal fails while creating the shard-2 virtual envelope, run the diagnostic fallback:
+Qwen4Exp already classifies `per_layer_token_embd.weight` as a CPU input tensor. The launch profile has no tensor override for PLE. The first full-Metal run reached inference, then failed with `kIOGPUCommandBufferCallbackErrorOutOfMemory`; it emitted no token and added 6.72 GB of system swap. Moving `output` to CPU makes the Metal envelope start after PLE and passed both fixed profiles. It is now the 64 GB default.
+
+The failing placement remains available for diagnosis:
 
 ```sh
-scripts/smoke-test.sh --shrink-metal-envelope /path/to/UD-IQ1_S
+scripts/smoke-test.sh --full-metal-output /path/to/UD-IQ1_S
 ```
 
-The wrapper adds `--override-tensor '^output=CPU'`. This moves the output projection to CPU so the Metal envelope starts after PLE; it is not part of the default profile.
+Do not use that option as a supported profile on this machine.
 
 ## Targeted Metal quant test
 

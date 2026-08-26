@@ -55,8 +55,9 @@ git -C "${SOURCE_DIR}" apply --reverse --check "${PATCH}" || {
     exit 1
 }
 git -C "${SOURCE_DIR}" diff --check
-[[ "$(git -C "${SOURCE_DIR}" diff --name-only)" == "src/llama-model.cpp" ]] || {
-    echo "error: patched source has changes outside src/llama-model.cpp" >&2
+expected_changes=$'ggml/src/ggml-metal/ggml-metal-device.m\nsrc/llama-model.cpp'
+[[ "$(git -C "${SOURCE_DIR}" diff --name-only)" == "${expected_changes}" ]] || {
+    echo "error: patched source has unexpected changes" >&2
     git -C "${SOURCE_DIR}" status --short >&2
     exit 1
 }
@@ -85,7 +86,7 @@ help="$("${CLI}" --help 2>&1)"
 for flag in '--offline' '--model' '--prompt' '--ctx-size' '--batch-size' '--ubatch-size' \
             '--n-predict' '--load-mode' '--gpu-layers' '--override-tensor' '--cache-ram' '--no-warmup' \
             '--seed' '--temp' '--color' '--simple-io' '--single-turn' \
-            '--no-display-prompt'; do
+            '--log-verbosity' '--perf' '--no-display-prompt'; do
     grep -Fq -- "${flag}" <<< "${help}" || {
         echo "error: pinned llama-cli help does not contain ${flag}" >&2
         exit 1
@@ -95,7 +96,7 @@ done
     --offline --load-mode mmap --gpu-layers all \
     --ctx-size 512 --batch-size 32 --ubatch-size 32 \
     --cache-ram 0 --no-warmup --color off --simple-io --single-turn \
-    --override-tensor '^output=CPU' \
+    --log-verbosity 4 --perf --override-tensor '^output=CPU' \
     --model /tmp/origami-flag-check-does-not-exist.gguf \
     --prompt Hello --n-predict 1 --seed 424242 --temp 0 --no-display-prompt \
     --version >/dev/null 2>&1

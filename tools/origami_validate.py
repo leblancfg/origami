@@ -49,6 +49,12 @@ SAFEGUARD_LOG_MARKERS = (
     "mmap prefetch disabled by LLAMA_MMAP_PREFETCH=0",
     "use residency sets    = false",
 )
+RUNTIME_FAILURE_MARKERS = (
+    "Error: Compute error.",
+    "Insufficient Memory",
+    "ggml_backend_sched_graph_compute_async failed",
+    "llama_decode: failed",
+)
 
 COMMANDS = {
     "df": "/bin/df",
@@ -456,6 +462,28 @@ def process_tree_rss(root_pid: int) -> Dict[str, Any]:
     }
 
 
+def extract_generated_output(stdout: str, prompt: str) -> str:
+    """Remove the pinned CLI's presentation wrapper from generated text."""
+    prompt_marker = "> " + prompt + "\n"
+    start = stdout.find(prompt_marker)
+    if start < 0:
+        return stdout
+    body = stdout[start + len(prompt_marker):]
+    stats = re.search(r"\n+\[ Prompt:", body)
+    if stats:
+        body = body[:stats.start()]
+    body = body.strip("\n")
+    thinking_marker = "[Start thinking]"
+    if body.startswith(thinking_marker):
+        body = body[len(thinking_marker):].lstrip("\n")
+    return body
+
+
+def find_runtime_failures(stdout: str, stderr: str) -> List[str]:
+    combined = stdout + "\n" + stderr
+    return [marker for marker in RUNTIME_FAILURE_MARKERS if marker in combined]
+
+
 def parse_timings(stderr: str) -> Dict[str, Any]:
     parsed: Dict[str, Any] = {}
     names = {
@@ -598,7 +626,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="set both lazy-mmap safeguards and require their backend log markers",
     )
-    parser.add_argument("--expected-output-sha256", help="fail unless raw stdout has this SHA-256")
+    parser.add_argument("--expected-output-sha256", help="fail unless generated output has this SHA-256")
     parser.add_argument("--verify-shards-sha256", action="store_true", help="read and hash shards that declare sha256")
     parser.add_argument("--sample-interval", type=float, default=1.0, help="telemetry interval in seconds")
     parser.add_argument("--timeout", type=float, default=1800.0, help="hard run timeout in seconds")
@@ -639,6 +667,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         },
         "project": git_identity(script_root),
     }
+    if args.expected_output_sha256:
+        result["smoke_test"]["expected_output_sha256"] = args.expected_output_sha256.lower()
     result["project"].update({
         "harness_path": str(Path(__file__).resolve().relative_to(script_root)),
         "harness_sha256": sha256_file(Path(__file__).resolve()),
@@ -759,14 +789,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         stdout_text = stdout_bytes.decode("utf-8", "replace")
         stderr_text = stderr_bytes.decode("utf-8", "replace")
-        output_hash = hashlib.sha256(stdout_bytes).hexdigest()
+        stdout_hash = hashlib.sha256(stdout_bytes).hexdigest()
+        generated_output = extract_generated_output(stdout_text, prompt)
+        output_hash = hashlib.sha256(generated_output.encode("utf-8")).hexdigest()
         timings = parse_timings(stderr_text)
         result["run"] = {
             "exit_code": returncode,
             "timed_out": timed_out,
             "wall_elapsed_seconds": round(wall_elapsed, 6),
+            "generated_output": generated_output,
+            "generated_output_sha256": output_hash,
             "stdout": stdout_text,
-            "stdout_sha256": output_hash,
+            "stdout_sha256": stdout_hash,
             "stdout_truncated": stdout_truncated,
             "stderr": stderr_text,
             "stderr_truncated": stderr_truncated,
@@ -790,10 +824,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for required_timing in ("prefill", "decode"):
             if required_timing not in timings:
                 failures.append("llama.cpp {} timing was not found on stderr".format(required_timing))
+        decode = timings.get("decode")
+        if decode is not None and decode.get("tokens", 0) < 1:
+            failures.append("llama.cpp decode timing reports no generated token")
+        for marker in find_runtime_failures(stdout_text, stderr_text):
+            failures.append("runtime reported a backend failure: " + marker)
         if args.expected_output_sha256 and output_hash != args.expected_output_sha256.lower():
-            failures.append("stdout SHA-256 does not match --expected-output-sha256")
-        if not stdout_bytes:
-            failures.append("runtime produced empty stdout")
+            failures.append("generated-output SHA-256 does not match --expected-output-sha256")
+        if not generated_output:
+            failures.append("runtime produced no generated output")
         if args.lazy_mmap_safeguards:
             for marker in SAFEGUARD_LOG_MARKERS:
                 if marker not in stderr_text:

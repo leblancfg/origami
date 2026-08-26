@@ -1,21 +1,21 @@
 # TDR 0001: lazy mmap PoC for Qwen3.8-Flash-Next on M2 Max
 
-Status: accepted for the first memory-fit run
+Status: accepted with CPU output placement for the 64 GB profile
 
 ## Decision
 
-Use llama.cpp PR #27742 at `bea3b12daee45876b0129a3602dc8f534ce30bf0` with full Metal layer placement, mmap, and these safeguards:
+Use llama.cpp PR #27742 at `bea3b12daee45876b0129a3602dc8f534ce30bf0` with mmap, all model layers on Metal, the output tensor on CPU, and these safeguards:
 
 ```text
 GGML_METAL_NO_RESIDENCY=1
 LLAMA_MMAP_PREFETCH=0
 ```
 
-`GGML_METAL_NO_RESIDENCY` exists in the pinned ggml source. [`patches/llama.cpp-bea3b12-mmap-prefetch-optout.patch`](../../patches/llama.cpp-bea3b12-mmap-prefetch-optout.patch) adds the second switch. The patch changes initial mmap advice, not tensor data or inference math.
+`GGML_METAL_NO_RESIDENCY` exists in the pinned ggml source. [`patches/llama.cpp-bea3b12-mmap-prefetch-optout.patch`](../../patches/llama.cpp-bea3b12-mmap-prefetch-optout.patch) adds the second switch and an early stderr diagnostic for the existing Metal switch. The diagnostic is needed because the pinned CLI initializes Metal before it applies command-line log verbosity. The patch does not change tensor data or inference math.
 
 The default llama.cpp path advises every shard with `POSIX_MADV_WILLNEED` and requests Metal residency for large mmap envelopes. Disabling those requests permits a test of Darwin and Metal page faults on selected expert data. mmap still has no cache ceiling or useful model-bytes-read telemetry. A generated token demonstrates memory fit only; it does not establish bounded serving behavior.
 
-Use the build and validation commands in [`docs/poc.md`](../poc.md). This decision does not define an alternate launch path.
+Use the build and validation commands in [`docs/poc.md`](../poc.md). The full-Metal output placement remains a failure-reproduction option, not an alternate supported path.
 
 ## Fixed revisions
 
@@ -59,7 +59,7 @@ The PLE operation remains on CPU, but its pages lie inside a no-copy Metal virtu
 
 `ggml_metal_buffer_map()` wraps mmap addresses in shared no-copy MTLBuffers. The MTLBuffer length is virtual accounting, not a second byte-for-byte weight allocation. Physical pages arrive when CPU or GPU operations access them. Darwin decides when clean file-backed pages are evicted, so this mapping cannot support a bounded-memory claim.
 
-If Metal cannot create the large shard-2 envelope, `--override-tensor '^output=CPU'` is the diagnostic fallback. Moving output tensors to CPU makes the first Metal tensor occur after PLE and shrinks the virtual envelope. The fallback adds a CPU output projection and is not a default tensor override.
+The first full-Metal inference command created the large shard-2 envelope but failed its command buffer with `kIOGPUCommandBufferCallbackErrorOutOfMemory`. It emitted no token, drove measured memory-pressure free percentage down to 7%, and grew swap by 6,721,172,930 bytes. Moving `output` to CPU makes the first Metal tensor occur after PLE and shrinks the virtual envelope. The resulting CPU output projection emitted a token with zero swap growth, so this placement is the 64 GB default.
 
 ## Quantized MoE kernels
 

@@ -9,12 +9,13 @@ BIN="${ORIGAMI_LLAMA_CLI:-${BUILD_DIR}/bin/llama-cli}"
 MANIFEST="${ROOT}/config/qwen38-flash-next-ud-iq1_s.json"
 PROFILE="first-token"
 OUTPUT=""
+EXPECTED_OUTPUT_SHA256=""
 PREFLIGHT_ONLY=0
 VERIFY_HASHES=0
-SHRINK_METAL_ENVELOPE=0
+FULL_METAL_OUTPUT=0
 
 usage() {
-    echo "usage: $0 [--preflight-only] [--validation] [--verify-shards-sha256] [--shrink-metal-envelope] [--output FILE] MODEL_DIRECTORY" >&2
+    echo "usage: $0 [--preflight-only] [--validation] [--verify-shards-sha256] [--full-metal-output] [--expected-output-sha256 HASH] [--output FILE] MODEL_DIRECTORY" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -22,7 +23,12 @@ while [[ $# -gt 0 ]]; do
         --preflight-only) PREFLIGHT_ONLY=1; shift ;;
         --validation) PROFILE="validation"; shift ;;
         --verify-shards-sha256) VERIFY_HASHES=1; shift ;;
-        --shrink-metal-envelope) SHRINK_METAL_ENVELOPE=1; shift ;;
+        --full-metal-output) FULL_METAL_OUTPUT=1; shift ;;
+        --expected-output-sha256)
+            [[ $# -ge 2 ]] || { usage; exit 2; }
+            EXPECTED_OUTPUT_SHA256="$2"
+            shift 2
+            ;;
         --output)
             [[ $# -ge 2 ]] || { usage; exit 2; }
             OUTPUT="$2"
@@ -52,6 +58,8 @@ expected_patch="$(shasum -a 256 "${ROOT}/patches/llama.cpp-bea3b12-mmap-prefetch
 if [[ -z "${OUTPUT}" ]]; then
     if [[ ${PREFLIGHT_ONLY} -eq 1 ]]; then
         OUTPUT="${ROOT}/artifacts/qwen38-preflight.json"
+    elif [[ ${FULL_METAL_OUTPUT} -eq 1 ]]; then
+        OUTPUT="${ROOT}/artifacts/qwen38-${PROFILE}-full-metal-output.json"
     else
         OUTPUT="${ROOT}/artifacts/qwen38-${PROFILE}.json"
     fi
@@ -67,6 +75,7 @@ args=(
     --profile "${PROFILE}"
 )
 [[ ${VERIFY_HASHES} -eq 0 ]] || args+=(--verify-shards-sha256)
+[[ -z "${EXPECTED_OUTPUT_SHA256}" ]] || args+=(--expected-output-sha256 "${EXPECTED_OUTPUT_SHA256}")
 if [[ ${PREFLIGHT_ONLY} -eq 1 ]]; then
     args+=(--preflight-only)
 else
@@ -83,8 +92,10 @@ else
         --color off
         --simple-io
         --single-turn
+        --log-verbosity 4
+        --perf
     )
-    if [[ ${SHRINK_METAL_ENVELOPE} -eq 1 ]]; then
+    if [[ ${FULL_METAL_OUTPUT} -eq 0 ]]; then
         args+=(--override-tensor '^output=CPU')
     fi
 fi
