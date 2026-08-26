@@ -21,6 +21,7 @@
 - [Atlas Qwen4Exp single-Spark draft, PR #754](https://github.com/Avarok-Cybersecurity/atlas/pull/754)
 - [Atlas LongCat NVMe n-gram cache, PR #746](https://github.com/Avarok-Cybersecurity/atlas/pull/746)
 - [Earlier llama.cpp n-gram embedding work, PR #19167](https://github.com/ggml-org/llama.cpp/pull/19167)
+- [Lucebox Qwen3.8 speculative decoding and GPU optimization, PR #625](https://github.com/Luce-Org/lucebox/pull/625)
 
 ## Local baseline
 

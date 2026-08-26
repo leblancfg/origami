@@ -2,7 +2,7 @@
 
 Origami is an experimental inference project for running sparse models whose full weights do not fit in memory. The first target is Qwen3.8-Flash-Next on 64 GB Apple Silicon, with routed experts streamed from SSD.
 
-The repository is private and exploratory. There is no working runtime yet.
+The repository is private and exploratory. There is no working runtime yet. [INTENT.md](INTENT.md) defines the hardware budget, scope, and engineering rules.
 
 ## Working hypothesis
 
