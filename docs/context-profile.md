@@ -20,7 +20,7 @@ A healthy `/health` response and `n_ctx = 262144` would prove allocation and dec
 
 ## Fail-closed profile
 
-[`config/qwen38-context-262144.json`](../config/qwen38-context-262144.json) retains the exact one-slot server arguments, telemetry thresholds, cache ledger, and staged prompt plan. It now requires a build-local `origami-context-capabilities.json`. The pinned bootstrap emits a capability manifest that contains only the mmap safeguards, so every execution action refuses the native profile.
+[`config/qwen38-context-262144.json`](../config/qwen38-context-262144.json) retains the exact one-slot server arguments, telemetry thresholds, cache ledger, and staged prompt plan. It requires a build-local `origami-context-capabilities.json`. The long-context bootstrap records the upstream fixes and each checked-in local delta. A missing, stale, or incomplete manifest blocks execution.
 
 ```sh
 # Safe and non-invasive.
@@ -38,6 +38,7 @@ The gate requires these named capabilities:
 2. `qwen4exp_qsa_quantized_kv_rotation`, corresponding to `0ac4b18025c2e255dd76252cd3b465683d08b257`.
 3. `qwen4exp_large_graph_node_budget`, corresponding to `c52ed2a0b0b865e82eb1b393106c48df1c39cb32`.
 4. `qwen4exp_f16_indexer_cache_split`, an Origami delta that is not present at the inspected PR head.
+5. `qwen4exp_shared_qsa_graph_inputs`, the opt-in, shape-checked one-set QSA input prototype.
 
 An upstream capability entry must contain the exact fixing commit recorded by the profile. The local split needs nonempty build evidence, and the manifest's runtime revision must match the profile. Revision and patch markers remain mandatory. The gate is an execution interlock, not a correctness certificate.
 
@@ -92,13 +93,15 @@ At 262,144 cells and microbatch 32:
 
 Persistent context includes 117,669,888 bytes of GDN state, 13,271,040 bytes of PLE state, and 25,165,824 bytes of eager host cell arrays. It excludes allocator overhead and occupied-cell tree nodes.
 
-The dense QSA figure is an exact logical input payload, not the complete scheduler buffer:
+The upstream dense QSA figure is an exact logical input payload, not the complete scheduler buffer:
 
 ```text
 12 * (12C + 4CU) = 440,401,920 bytes, C=262144, U=32
 ```
 
-At the 512-cell PoC, the actual scheduler reserve was much larger than this term. The guarded allocation must record Metal and CPU scheduler buffers at the target context.
+The checked-in opt-in prototype shares that layer-independent input set. With `LLAMA_QSA_SHARED_INPUTS=1`, the same boundary uses `12C + 4CU = 36,700,160` input bytes. It preserves the existing score expansion, top-k operation, and dense attention mask, so this is a host-input bound rather than a sparse-attention implementation or scheduler-buffer bound. See [the build and parity record](results/qsa-shared-inputs-213df585.md).
+
+At the 512-cell PoC, the actual scheduler reserve was much larger than the input term. The guarded allocation must record Metal and CPU scheduler buffers at the target context.
 
 Each recurrent checkpoint copies 130,940,928 logical bytes. The pinned default maximum of 32 adds 4,190,109,696 bytes. The research profile sets `--ctx-checkpoints 0`. It also sets `--cache-ram 0`, `--no-cache-prompt`, and `--cache-reuse 0`.
 
@@ -126,4 +129,4 @@ Each profile preserves `original_max_position_embeddings = 262144`. Neither chan
 
 ## Recommendation
 
-Continue using the 512-token pinned PoC only for reference work. Do not start the checked-in 262,144, 524,288, or 1,000,000 profiles. For native 262,144 research, implement the four required capabilities, beginning with the later PR fixes and the Q8_0-main/F16-indexer split. Then run the guarded allocation and staged prompt sequence on an otherwise quiet 64 GB host. Keep checkpoints disabled. Do not publish the Pi profile until filled-context safety, long-prompt operation, and correctness have separate passing records.
+Continue using the 512-token pinned PoC for reference work. Treat the native profile as an allocation candidate, not a certified server profile, and do not start the 524,288 or 1,000,000 profiles. Run the guarded native allocation and staged prompt sequence on an otherwise quiet 64 GB host. Keep checkpoints disabled. Do not publish the Pi profile until filled-context safety, long-prompt operation, and correctness have separate passing records.

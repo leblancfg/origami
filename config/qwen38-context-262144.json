@@ -23,6 +23,10 @@
       {
         "name": "qwen4exp_f16_indexer_cache_split",
         "required_local_delta": "Pass separate indexer K/V types to llama_memory_hybrid_idx; keep the QSA routing key F16 while main attention K/V is independently quantized; allocate no unused indexer V tensor."
+      },
+      {
+        "name": "qwen4exp_shared_qsa_graph_inputs",
+        "required_local_delta": "With LLAMA_QSA_SHARED_INPUTS=1, allocate and fill one shape-checked QSA metadata/bias input set and reuse it unchanged across all twelve QSA layers."
       }
     ]
   },
@@ -32,7 +36,8 @@
     "alias": "origami-qwen38-250000-candidate",
     "environment": {
       "GGML_METAL_NO_RESIDENCY": "1",
-      "LLAMA_MMAP_PREFETCH": "0"
+      "LLAMA_MMAP_PREFETCH": "0",
+      "LLAMA_QSA_SHARED_INPUTS": "1"
     },
     "arguments": [
       "--offline",
@@ -77,6 +82,7 @@
       "size = 3114.19 MiB (250112 cells,  12 layers",
       "creating indexer KV cache, size = 250112 cells",
       "Qwen4Exp indexer cache types: K = f16, V = none (key-only)",
+      "Qwen4Exp QSA graph inputs shared across layers (LLAMA_QSA_SHARED_INPUTS=1)",
       "size =  732.75 MiB (250112 cells,  12 layers",
       "prompt cache is disabled",
       "context checkpoints disabled",
@@ -107,8 +113,10 @@
     "ple_recurrent_state_bytes": 13271040,
     "eager_cell_array_bytes": 24010752,
     "persistent_payload_bytes": 4188758016,
-    "dense_qsa_graph_input_floor_bytes_at_ubatch_8": 132059136,
-    "context_and_graph_input_lower_bound_bytes": 4320817152,
+    "unshared_qsa_graph_input_floor_bytes_at_ubatch_8": 132059136,
+    "shared_qsa_graph_input_bound_bytes_at_ubatch_8": 11004928,
+    "qsa_graph_input_reduction_bytes": 121054208,
+    "context_and_graph_input_lower_bound_bytes": 4199762944,
     "checkpoint_count": 0,
     "checkpoint_copy_bytes": 0,
     "pinned_default_32_checkpoint_copy_bytes": 4190109696,

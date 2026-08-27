@@ -79,15 +79,26 @@ def eager_cell_array_bytes(cells: int) -> int:
     return N_CELL_ARRAYS * CELL_ARRAY_BYTES_PER_CACHE_TOKEN * cells
 
 
-def qsa_graph_input_floor(cells: int, ubatch: int) -> int:
-    """Logical bytes for QSA's dense inputs, not the full scheduler buffer.
+def qsa_graph_input_floor(cells: int, ubatch: int, replicas: int = N_QSA_LAYERS) -> int:
+    """Logical QSA host-input bytes, not the full scheduler buffer.
 
-    For each QSA layer: cell_blk=4C, blk_cells=4C, blk_pos=4C, and
-    bias=4*C*U because C is padded to a multiple of the compression ratio 4.
+    One input set has cell_blk=4C, blk_cells=4C, blk_pos=4C, and
+    bias=4*C*U because C is padded to a multiple of compression ratio 4.
+    The upstream graph has one set per QSA layer. The guarded Origami prototype
+    aliases the byte-identical inputs across layers and therefore has one set.
     """
+    if cells <= 0:
+        raise ValueError("cells must be positive")
     if ubatch <= 0:
         raise ValueError("ubatch must be positive")
-    return N_QSA_LAYERS * (12 * cells + 4 * cells * ubatch)
+    if replicas <= 0 or replicas > N_QSA_LAYERS:
+        raise ValueError(f"replicas must be between 1 and {N_QSA_LAYERS}")
+    return replicas * (12 * cells + 4 * cells * ubatch)
+
+
+def qsa_shared_graph_input_bound(cells: int, ubatch: int) -> int:
+    """Exact logical host-input payload with LLAMA_QSA_SHARED_INPUTS=1."""
+    return qsa_graph_input_floor(cells, ubatch, replicas=1)
 
 
 def checkpoint_bytes(count: int) -> int:
@@ -131,6 +142,7 @@ def ledger(
     index_type_k: str | None = None,
     index_type_v: str | None = None,
     index_key_only: bool = False,
+    shared_qsa_inputs: bool = False,
     checkpoints: int = 0,
 ) -> Ledger:
     cells = pad_context(requested)
@@ -144,7 +156,7 @@ def ledger(
         gdn_state=GDN_STATE_BYTES,
         ple_state=PLE_CONV_BYTES,
         cell_arrays=eager_cell_array_bytes(cells),
-        qsa_input_floor=qsa_graph_input_floor(cells, ubatch),
+        qsa_input_floor=qsa_graph_input_floor(cells, ubatch, 1 if shared_qsa_inputs else N_QSA_LAYERS),
         checkpoint_copies=checkpoint_bytes(checkpoints),
     )
 
@@ -171,6 +183,7 @@ def main() -> int:
     parser.add_argument("--index-type-k", choices=KV_TYPES)
     parser.add_argument("--index-type-v", choices=KV_TYPES)
     parser.add_argument("--index-key-only", action="store_true")
+    parser.add_argument("--qsa-shared-inputs", action="store_true")
     parser.add_argument("--checkpoints", type=int, default=0)
     parser.add_argument("--ubatch", type=int, default=32)
     args = parser.parse_args()
@@ -179,7 +192,8 @@ def main() -> int:
     idx_v = "none" if args.index_key_only else (args.index_type_v or args.type_v)
     print(
         f"main K={args.type_k}, main V={args.type_v}, "
-        f"index K={idx_k}, index V={idx_v}, ubatch={args.ubatch}, checkpoints={args.checkpoints}"
+        f"index K={idx_k}, index V={idx_v}, ubatch={args.ubatch}, "
+        f"QSA input sets={'1 shared' if args.qsa_shared_inputs else N_QSA_LAYERS}, checkpoints={args.checkpoints}"
     )
     for requested in args.contexts:
         item = ledger(
@@ -190,6 +204,7 @@ def main() -> int:
             index_type_k=args.index_type_k,
             index_type_v=args.index_type_v,
             index_key_only=args.index_key_only,
+            shared_qsa_inputs=args.qsa_shared_inputs,
             checkpoints=args.checkpoints,
         )
         factor = yarn_factor(requested)
@@ -202,7 +217,7 @@ def main() -> int:
             ("PLE recurrent", item.ple_state),
             ("eager cell-array payload", item.cell_arrays),
             ("persistent payload", item.persistent_payload),
-            ("dense QSA input floor", item.qsa_input_floor),
+            ("QSA graph input bound", item.qsa_input_floor),
             ("startup lower bound", item.startup_lower_bound),
             ("checkpoint copies", item.checkpoint_copies),
             ("filled-context lower bound", item.filled_context_lower_bound),

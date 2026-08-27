@@ -10,6 +10,7 @@ from tools.qwen38_context_accounting import (
     main_kv_bytes,
     pad_context,
     qsa_graph_input_floor,
+    qsa_shared_graph_input_bound,
     yarn_factor,
 )
 
@@ -33,6 +34,29 @@ class Qwen38ContextAccountingTests(unittest.TestCase):
 
     def test_qsa_graph_input_floor_matches_pinned_profile(self):
         self.assertEqual(qsa_graph_input_floor(262_144, 32), 440_401_920)
+
+    def test_shared_qsa_input_shape_is_one_exact_layer_independent_set(self):
+        cells = 262_144
+        ubatch = 32
+        shared = qsa_shared_graph_input_bound(cells, ubatch)
+        dense = qsa_graph_input_floor(cells, ubatch)
+        self.assertEqual(shared, 36_700_160)
+        self.assertEqual(dense, 12 * shared)
+        self.assertEqual(dense - shared, 403_701_760)
+
+        item = ledger(
+            cells, "q8_0", "q8_0", ubatch,
+            index_type_k="f16", index_key_only=True, shared_qsa_inputs=True,
+        )
+        self.assertEqual(item.qsa_input_floor, shared)
+        self.assertEqual(item.startup_lower_bound, 4_420_665_344)
+
+    def test_shared_qsa_bound_rejects_invalid_shapes(self):
+        for args in ((0, 8), (262_144, 0)):
+            with self.assertRaises(ValueError):
+                qsa_shared_graph_input_bound(*args)
+        with self.assertRaises(ValueError):
+            qsa_graph_input_floor(262_144, 8, replicas=13)
 
     def test_quantized_payload_coefficients(self):
         cells = 1_000_192

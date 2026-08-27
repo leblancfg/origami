@@ -51,6 +51,7 @@ class ContextProfileTests(unittest.TestCase):
         self.assertEqual(environment, {
             "GGML_METAL_NO_RESIDENCY": "1",
             "LLAMA_MMAP_PREFETCH": "0",
+            "LLAMA_QSA_SHARED_INPUTS": "1",
         })
 
     def test_q8_main_and_f16_key_only_indexer_ledger_is_byte_exact(self):
@@ -68,8 +69,10 @@ class ContextProfileTests(unittest.TestCase):
         self.assertEqual(indexer, 768344064)
         self.assertEqual(memory["total_kv_bytes"], attention + indexer)
         self.assertEqual(memory["persistent_payload_bytes"], 4188758016)
-        self.assertEqual(memory["dense_qsa_graph_input_floor_bytes_at_ubatch_8"], 132059136)
-        self.assertEqual(memory["context_and_graph_input_lower_bound_bytes"], 4320817152)
+        self.assertEqual(memory["unshared_qsa_graph_input_floor_bytes_at_ubatch_8"], 132059136)
+        self.assertEqual(memory["shared_qsa_graph_input_bound_bytes_at_ubatch_8"], 11004928)
+        self.assertEqual(memory["qsa_graph_input_reduction_bytes"], 121054208)
+        self.assertEqual(memory["context_and_graph_input_lower_bound_bytes"], 4199762944)
         self.assertEqual(memory["pinned_default_32_checkpoint_copy_bytes"], 4190109696)
 
     def test_log_proof_requires_capacity_qsa_flash_and_safeguards(self):

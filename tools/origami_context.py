@@ -61,6 +61,14 @@ def load_profile(path: Path) -> Dict[str, Any]:
         raise ContextError("context profile needs a repository-relative runtime_patch")
     if memory.get("total_kv_bytes") != memory.get("attention_kv_bytes", 0) + memory.get("qsa_indexer_kv_bytes", 0):
         raise ContextError("context profile KV byte ledger does not add up")
+    shared_qsa = memory.get("shared_qsa_graph_input_bound_bytes_at_ubatch_8")
+    unshared_qsa = memory.get("unshared_qsa_graph_input_floor_bytes_at_ubatch_8")
+    if not isinstance(shared_qsa, int) or shared_qsa <= 0 or not isinstance(unshared_qsa, int):
+        raise ContextError("context profile needs shared and unshared QSA input bounds")
+    if memory.get("qsa_graph_input_reduction_bytes") != unshared_qsa - shared_qsa:
+        raise ContextError("context profile QSA input reduction does not add up")
+    if memory.get("context_and_graph_input_lower_bound_bytes") != memory.get("persistent_payload_bytes", 0) + shared_qsa:
+        raise ContextError("context and shared QSA input lower bound does not add up")
     gate = profile.get("execution_gate")
     if not isinstance(gate, dict) or not isinstance(gate.get("capability_manifest"), str):
         raise ContextError("context profile needs an execution capability gate")

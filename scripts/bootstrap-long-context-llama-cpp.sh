@@ -37,7 +37,7 @@ git -C "${SOURCE_DIR}" apply --check "${PATCH}"
 git -C "${SOURCE_DIR}" apply "${PATCH}"
 git -C "${SOURCE_DIR}" apply --reverse --check "${PATCH}"
 git -C "${SOURCE_DIR}" diff --check
-expected_changes=$'ggml/src/ggml-metal/ggml-metal-device.m\nsrc/llama-kv-cache.cpp\nsrc/llama-kv-cache.h\nsrc/llama-memory-hybrid-idx.cpp\nsrc/llama-memory-hybrid-idx.h\nsrc/llama-model.cpp'
+expected_changes=$'ggml/src/ggml-metal/ggml-metal-device.m\nsrc/llama-kv-cache.cpp\nsrc/llama-kv-cache.h\nsrc/llama-memory-hybrid-idx.cpp\nsrc/llama-memory-hybrid-idx.h\nsrc/llama-model.cpp\nsrc/models/models.h\nsrc/models/qwen4exp.cpp'
 [[ "$(git -C "${SOURCE_DIR}" diff --name-only)" == "${expected_changes}" ]] || {
     echo "error: long-context patch changed unexpected files" >&2
     git -C "${SOURCE_DIR}" status --short >&2
@@ -69,7 +69,8 @@ cat > "${BUILD_DIR}/origami-context-capabilities.json" <<EOF
     "qwen4exp_indexer_cache_coupled_and_reported": "035e22731a7fd70b9854b3a2d64ec68e9b1a45d3",
     "qwen4exp_qsa_quantized_kv_rotation": "0ac4b18025c2e255dd76252cd3b465683d08b257",
     "qwen4exp_large_graph_node_budget": "c52ed2a0b0b865e82eb1b393106c48df1c39cb32",
-    "qwen4exp_f16_indexer_cache_split": "${REVISION} plus $(shasum -a 256 "${PATCH}" | awk '{print $1}')"
+    "qwen4exp_f16_indexer_cache_split": "${REVISION} plus $(shasum -a 256 "${PATCH}" | awk '{print $1}')",
+    "qwen4exp_shared_qsa_graph_inputs": "${REVISION} plus $(shasum -a 256 "${PATCH}" | awk '{print $1}')"
   }
 }
 EOF

@@ -59,14 +59,14 @@ Packing is resumable and atomically publishes a fixed-format binary pack plus JS
 
 ## Long-context research profile
 
-The GGUF declares a native 262,144-token window, but the pinned Q8_0 QSA graph asserts during construction. The profile is retained as a byte-exact, fail-closed research artifact. It proposes Q8_0 main attention KV with an F16 indexer cache, a split the current backend API cannot express.
+The GGUF declares a native 262,144-token window. The guarded candidate uses the 213df585 runtime plus the checked-in patch: Q8_0 main attention KV, an F16 key-only indexer cache, quantized-cache rotation support, and opt-in shared QSA graph inputs. It requests 250,000 tokens and has not completed an allocation or prompt probe.
 
 ```sh
 # Prints status and the missing backend capabilities. It does not inspect shards.
 scripts/context-profile.sh status
 
-# Refuses because the pinned build cannot satisfy the capability gate.
+# Requires a matching bootstrap build and a complete model manifest.
 scripts/context-profile.sh command /path/to/UD-IQ1_S
 ```
 
-No native-context allocation has run on the test host. Factor-2 524,288 and factor-4 1,000,000 static-YaRN work use separate nonlaunchable configs. See [docs/context-profile.md](docs/context-profile.md) for the upstream fix trace, exact cache and checkpoint ledgers, graph scratch, staged proof requirements, and operational recommendation.
+No native-context allocation has run on the test host. The shared-input prototype cuts the guarded profile's logical QSA host inputs from 132,059,136 to 11,004,928 bytes, but leaves dense masks and dense attention in the graph. Factor-2 524,288 and factor-4 1,000,000 static-YaRN work use separate nonlaunchable configs. See [docs/context-profile.md](docs/context-profile.md) and [the QSA build record](docs/results/qsa-shared-inputs-213df585.md).
