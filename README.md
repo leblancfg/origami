@@ -44,6 +44,19 @@ python3 -m origami_artifacts /path/to/gguf/shards --json --output ledger.json
 
 `tools/gguf-map-audit.py` imports the same bounded parser and adds the pinned llama.cpp placement model. See [docs/artifact-inspector.md](docs/artifact-inspector.md), [docs/plan.md](docs/plan.md), and [docs/validation.md](docs/validation.md).
 
+## Routed-expert sidecar
+
+The sidecar packer groups each `(layer, expert)` gate/up/down triple into an aligned record while preserving the original quantized bytes and GGUF metadata. An index-only run checks real headers without copying the 39.8 GB routed payload:
+
+```sh
+python3 -m origami_artifacts.sidecar index /path/to/UD-IQ1_S \
+  --source-revision d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249 \
+  --source-manifest config/qwen38-flash-next-ud-iq1_s.json \
+  --index experts.index-only.json
+```
+
+Packing is resumable and atomically publishes a fixed-format binary pack plus JSON index. Sample/full byte verification, an aligned `pread` API, and a benchmark command are included. See [docs/expert-sidecar.md](docs/expert-sidecar.md) for the exact format and recovery contract.
+
 ## Long-context research profile
 
 The GGUF declares a native 262,144-token window, but the pinned Q8_0 QSA graph asserts during construction. The profile is retained as a byte-exact, fail-closed research artifact. It proposes Q8_0 main attention KV with an F16 indexer cache, a split the current backend API cannot express.
