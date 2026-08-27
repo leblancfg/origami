@@ -1,0 +1,37 @@
+{
+  "schema_version": "origami.static-yarn-research-profile.v1",
+  "name": "qwen38-static-yarn-factor-2-524288",
+  "status": "research-only-not-launchable",
+  "official_recipe": {
+    "native_context_tokens": 262144,
+    "context_tokens": 524288,
+    "yarn_factor": 2.0,
+    "rope_type": "yarn",
+    "original_max_position_embeddings": 262144
+  },
+  "pinned_llama_cpp_argument_recipe": [
+    "--ctx-size", "524288",
+    "--override-kv", "qwen4exp.context_length=int:524288",
+    "--rope-scaling", "yarn",
+    "--rope-scale", "2",
+    "--yarn-orig-ctx", "262144"
+  ],
+  "memory_at_ubatch_32": {
+    "allocated_cells": 524288,
+    "all_q8_0_kv_bytes_unapproved": 9412018176,
+    "q8_0_main_f16_index_kv_bytes_candidate": 11676942336,
+    "q8_0_main_f16_index_persistent_payload_bytes": 11858214912,
+    "dense_qsa_graph_input_floor_bytes": 880803840,
+    "context_and_graph_input_lower_bound_bytes": 12739018752,
+    "pinned_default_32_checkpoint_copy_bytes": 4190109696
+  },
+  "validated_prompt_tokens": 0,
+  "pi_context_window": null,
+  "blocking_requirements": [
+    "all native-profile backend capabilities",
+    "factor-2 core and indexer RoPE parity",
+    "allocation and filled-context memory proof",
+    "prompt processing past 262144 tokens",
+    "long-context retrieval and generation parity"
+  ]
+}

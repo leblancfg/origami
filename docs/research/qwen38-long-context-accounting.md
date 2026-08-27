@@ -2,13 +2,15 @@
 
 ## Decision
 
-The pinned llama.cpp path is **no-go for 250K, 262,144, 500K, and 1M serving** on this host.
+The pinned llama.cpp path cannot construct the configured Q8_0 QSA graph at 262,144 tokens. It is also uncertified for F16 native context and for either static-YaRN target. The checked-in execution gate therefore refuses all long-context launches.
 
-At 250K and 262,144, the model is inside its native position range, but the CPU-output mmap profile leaves too little Metal headroom once llama.cpp eagerly allocates full-context K/V, indexer K/V, recurrent state, and its worst-case graph. The 500K and 1M F16 profiles exceed Metal's reported working-set recommendation before the full graph and active mapped pages are counted. Quantized K/V would reduce the payload, but the pinned QSA graph does not support it correctly. The official static-YaRN math is present in the pinned RoPE kernels, but the GGUF does not enable it and no long-context parity test exists.
+Allocation arithmetic alone does not establish a no-go. At native context, F16 leaves a small provisioning margin and Q8_0 leaves a larger one, but the calculation mixes Metal virtual mmap envelopes with committed context buffers. It is neither an RSS forecast nor a substitute for scheduler allocation and filled-prompt telemetry. At 500K and 1M, the same screen exceeds Metal's recommendation for F16. That result rejects the configuration under the current provisioning rule; it does not prove that every bounded runtime must fail.
 
-These findings do not rule out a native Origami runtime. They rule out certifying the current mmap reference as the long-context runtime.
+Quantized main attention K/V is the smallest credible capacity reduction. The pin asserts during QSA graph construction, and its shared cache-type API also quantizes the routing indexer key. Later PR #27742 code fixes the rotation assertion. Origami still needs a separate F16 indexer type before attempting the guarded native profile. The official static-YaRN math is present in the pinned RoPE kernels, but no long-context parity test exists.
 
-`250K`, `500K`, and `1M` below mean 250,000, 500,000, and 1,000,000 tokens. llama.cpp pads a requested context to 256 cells, so their allocations use 250,112, 500,224, and 1,000,192 cells.
+These findings rule out certifying the current mmap reference as the long-context runtime. They do not rule out a native Origami runtime.
+
+`250K`, `500K`, and `1M` in the accounting tables mean 250,000, 500,000, and 1,000,000 tokens. llama.cpp pads those requests to 250,112, 500,224, and 1,000,192 cells. The official factor-2 research profile uses 524,288 rather than the 500K comparison row; factor 4 uses a 1,000,000-token request.
 
 ## Sources inspected
 
@@ -19,7 +21,7 @@ These findings do not rule out a native Origami runtime. They rule out certifyin
 | Unsloth GGUF | `unsloth/Qwen3.8-Flash-Next-GGUF` `d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249`, `UD-IQ1_S` | GGUF metadata and 1,224-tensor inventory |
 | Transformers Qwen4Exp | PR #48337 commit `b61b98bea4cd99ff97da2ca0aa4fa34e8800d10e` | `Qwen4ExpTextGatedDeltaNet`, `Qwen4ExpTextQSAIndexer`, `Qwen4ExpTextNGramEmbedding`, `Qwen4ExpTextPLELayer`, `Qwen4ExpTextRotaryEmbedding`; generic `_compute_yarn_parameters` |
 | Pinned llama.cpp | PR #27742 commit `bea3b12daee45876b0129a3602dc8f534ce30bf0` plus Origami's mmap diagnostic patch | `llama_model_qwen4exp::graph`, `build_qsa_top_k`, `build_layer_attn`, `build_ple`, `llama_memory_hybrid`, `llama_kv_cache`, `llama_memory_recurrent`, `llama_context::sched_reserve`, Metal `kernel_rope_multi` |
-| Later PR #27742 head, comparison only | `ef9fa1ba1f0d3f11ed7ddc1da94e5db4c22ae7b6` | Post-pin fixes `035e22731`, `cfbdc0a50`, `d22d2be2b`, `0ac4b1802`, `c52ed2a0b` |
+| Later PR #27742 head, comparison only | `0b19188e9` | Post-pin fixes `035e22731`, `cfbdc0a50`, `d22d2be2b`, `0ac4b1802`, `c52ed2a0b`, `24ea62df4`, `0b19188e9` |
 
 The model metadata was read positionally. No tensor body was executed, and the 72.5 GB model was not run for this work.
 
@@ -172,7 +174,7 @@ A direct Metal API query on this host reports `recommendedMaxWorkingSetSize = 55
 | 500,000 | 60,936,040,960 | -5,273,252,352 |
 | 1,000,000 | 78,718,902,784 | -23,056,114,176 |
 
-The lower bound omits the rest of the compute graph, CPU repack and output buffers, resident file pages, active expert and PLE pages, C++ tree nodes, checkpoint copies, macOS, and ordinary development tools. It also mixes virtual mmap envelopes with committed buffers, so it is a conservative provisioning test rather than an RSS prediction. The negative 500K and 1M margins are hard failures. The roughly 3 GB native margins are below the uncounted allocations and the project's system headroom requirement.
+The lower bound omits the rest of the compute graph, CPU repack and output buffers, resident file pages, active expert and PLE pages, C++ tree nodes, checkpoint copies, macOS, and ordinary development tools. It also mixes virtual mmap envelopes with committed buffers, so it is a conservative provisioning test rather than an RSS prediction. A negative margin fails this provisioning rule but does not prove physical out-of-memory from virtual-envelope arithmetic. The roughly 3 GB native F16 margin cannot certify the uncounted allocations; Q8_0 or a split-cache design must still pass measured allocation and filled-prompt gates.
 
 PLE has no explicit cache in this path. Its 28,800,138,240-byte IQ4_NL table remains mmap-backed, with Darwin deciding page retention and read-ahead. A bounded Origami row cache must account separately for page-aligned PLE reads. The existing worst-case cold demand remains 16 rows and at most sixteen 16 KiB pages, 262,144 bytes, per token before cache hits.
 
@@ -182,9 +184,13 @@ The CLI accepts F32, F16, BF16, Q8_0, Q4_0, Q4_1, IQ4_NL, Q5_0, and Q5_1 for K a
 
 That option surface does not establish Qwen4Exp QSA support at the pin. Quantized main K/V enables Hadamard cache rotations. The pinned top-k overload of `llm_graph_context::build_attn()` asserts that `self_k_rot` and `self_v_rot` are null, so a normal quantized QSA cache cannot construct the graph. Disabling rotation with `LLAMA_ATTN_ROT_DISABLE=1` avoids that assertion but creates an untested lossy path, including quantization of the raw indexer key that decides discrete top-k routing.
 
-Later PR commit `0ac4b1802` explicitly adds quantized-K/V rotation handling to the QSA attention path. It postdates `bea3b12`, so it cannot be credited to the pinned runtime. Even on that later code, indexer-key quantization needs token, logit, and selected-index parity tests. The safe first optimization is quantized main attention K/V with the 128-dimensional indexer K kept F16 or BF16; the current shared `type_k` setting cannot express that split.
+Later PR commit `0ac4b1802` explicitly adds quantized-K/V rotation handling to the QSA attention path. It postdates `bea3b12`, so it cannot be credited to the pinned runtime. Commit `c52ed2a0b` separately adds Qwen4Exp to the large graph-node budget. Both belong in any quantized native candidate.
 
-## YaRN and 500K/1M correctness
+Even on that later code, indexer-key quantization needs token, logit, and selected-index parity tests. The first candidate keeps main attention K/V at Q8_0 and the 128-dimensional indexer K at F16. The current shared `type_k` and `type_v` settings cannot express that split. The smallest implementation adds separate indexer types to `llama_memory_hybrid_idx`; using its generic cache initially retains an unused 256-dimensional F16 V side. A key-only QSA allocator would remove that side, but requires a model-specific cache API.
+
+At 262,144 cells, Q8_0 main attention plus the generic F16 indexer cache uses 5,838,471,168 KV bytes. Persistent context is 5,994,577,920 bytes, and adding the exact 440,401,920-byte dense QSA input floor gives 6,434,979,840 bytes. A key-only F16 indexer would reduce the indexer from 2,415,919,104 to 805,306,368 bytes.
+
+## YaRN and 524,288/1M correctness
 
 The official Hugging Face keys are:
 
@@ -209,13 +215,15 @@ The Unsloth artifact contains none of those scaling keys. At the pin, llama.cpp 
 The equivalent pinned CLI settings are:
 
 ```text
-500K: --ctx-size 500000  --rope-scaling yarn --rope-scale 2 --yarn-orig-ctx 262144
-1M:   --ctx-size 1000000 --rope-scaling yarn --rope-scale 4 --yarn-orig-ctx 262144
+524,288: --ctx-size 524288  --override-kv qwen4exp.context_length=int:524288  --rope-scaling yarn --rope-scale 2 --yarn-orig-ctx 262144
+1M:      --ctx-size 1000000 --override-kv qwen4exp.context_length=int:1000000 --rope-scaling yarn --rope-scale 4 --yarn-orig-ctx 262144
 ```
+
+The metadata override is needed because the pinned server caps slot context to the declared training context. It changes the exposed ceiling; `--yarn-orig-ctx 262144` retains the real scaling origin.
 
 The implementation is more than an upstream claim: `llama-context.cpp` derives the static YaRN parameters, Qwen4Exp passes them to `ggml_rope_multi()` for both core Q/K and indexer Q/pooled-K, and Metal `kernel_rope_multi` handles interleaved MRoPE with YaRN. Its correction dimensions use `n_dims=64`, base 10,000,000, original context 262,144, and default beta values 32/1, matching the Transformers YaRN inputs. llama.cpp cancels its generic kernel's internal magnitude multiplier before the kernel reapplies it, yielding the standard static-YaRN attention scaling.
 
-The pinned branch still lacks evidence for an end-to-end correctness claim. No test at the pin compares RoPE values with Transformers at factor 2 or 4, exercises QSA block selection near 500K/1M, or runs long-context retrieval. The only measured Origami run used 512 cells. The official report's 1M benchmark validates Qwen's serving stack, not this llama.cpp commit. Later PR #27742 needed fixes for indexer state serialization, PLE context ownership, quantized QSA, and Qwen4Exp graph sizing. Treat 500K and 1M as implemented static-YaRN code paths that remain uncertified and currently fail the memory gate.
+The pinned branch still lacks evidence for an end-to-end correctness claim. No test at the pin compares RoPE values with Transformers at factor 2 or 4, exercises QSA block selection near 524,288/1M, or runs long-context retrieval. The only measured Origami run used 512 cells. The official report's 1M benchmark validates Qwen's serving stack, not this llama.cpp commit. Later PR #27742 needed fixes for indexer state serialization, PLE context ownership, quantized QSA, and Qwen4Exp graph sizing. Treat the 524,288 factor-2 and 1,000,000 factor-4 paths as implemented static-YaRN code paths that remain uncertified and fail the current provisioning gate.
 
 ## Go/no-go gates
 
@@ -225,10 +233,10 @@ A context profile may be marked go only when all of these checks pass:
 2. The runtime replaces the twelve `F32[C,U]` QSA bias tensors and dense top-k masks with bounded sparse metadata and a sparse Metal attention path. Record actual Metal and CPU scheduler buffer sizes at each target C and production U; source-derived lower bounds are insufficient.
 3. The indexer cache appears in memory reporting and state save/restore. PLE history must be per context. Rewrites, multi-turn reuse, and prefix restore must preserve selected QSA indices and greedy tokens.
 4. F16/BF16 K/V must match the Transformers reference on logits, selected blocks, and greedy tokens before any cache quantization. A quantized profile needs the same checks at short, native-boundary, and extended positions. Quantizing indexer K is a separate lossy experiment.
-5. Factor-2 and factor-4 RoPE values must match Transformers for text positions around 262,143/262,144, 499,999, and 999,999 in both core attention and the pooled indexer. Retrieval and generation tests must then pass at 500K and 1M.
+5. Factor-2 and factor-4 RoPE values must match Transformers for text positions around 262,143/262,144, 524,287, and 999,999 in both core attention and the pooled indexer. Retrieval and generation tests must then pass at 524,288 and 1M.
 6. The bounded native runtime must keep application allocations at or below 55,662,788,608 bytes and reserve at least 12 GiB of the Mac's 68,719,476,736 bytes for macOS and development tools. The current artifact's non-streamed resident-weight basis is 3,889,410,560 bytes; the 39,845,888,000 routed-expert bytes and 28,800,138,240 PLE bytes must stay behind explicit caches.
 
-Until those gates pass: 250K and 262,144 are **algorithmically native but operationally no-go** in the pinned mmap runtime; 500K and 1M are **static-YaRN code paths, memory no-go, and correctness uncertified**.
+Until those gates pass, 250K and 262,144 remain algorithmically native but unavailable in the pinned mmap runtime. The configured Q8_0 profile fails graph construction, while F16 has no allocation or filled-context proof. The 524,288 factor-2 and 1,000,000 factor-4 static-YaRN profiles remain separate, nonlaunchable experiments with failed provisioning screens and no correctness evidence.
 
 ## Reproduction artifact
 
@@ -237,6 +245,9 @@ Until those gates pass: 250K and 262,144 are **algorithmically native but operat
 ```sh
 python3 tools/qwen38_context_accounting.py
 python3 tools/qwen38_context_accounting.py --type-k q8_0 --type-v q8_0
+python3 tools/qwen38_context_accounting.py 262144 \
+  --type-k q8_0 --type-v q8_0 \
+  --index-type-k f16 --index-type-v f16 --checkpoints 0
 ```
 
-`tests/test_qwen38_context_accounting.py` fixes the padding, state, F16, Q8_0, Q4_0, graph-floor, and YaRN-band values used above.
+Pass `--index-key-only` only to model the required allocator change. It does not describe the pin or the later inspected PR head. `--checkpoints 32` adds the pinned maximum of recurrent-state copies. `tests/test_qwen38_context_accounting.py` fixes the padding, state, F16, Q8_0, Q4_0, split-indexer, checkpoint, graph-floor, and YaRN-band values used above.

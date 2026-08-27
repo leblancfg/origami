@@ -78,6 +78,15 @@ cmake --build "${BUILD_DIR}" --config Release -j "${jobs}" \
     --target llama-cli llama-server test-llama-archs test-backend-ops
 printf '%s\n' "${REVISION}" > "${BUILD_DIR}/origami-revision.txt"
 shasum -a 256 "${PATCH}" | awk '{print $1}' > "${BUILD_DIR}/origami-patch.sha256"
+cat > "${BUILD_DIR}/origami-context-capabilities.json" <<EOF
+{
+  "schema_version": "origami.backend-capabilities.v1",
+  "runtime_revision": "${REVISION}",
+  "capabilities": {
+    "lazy_mmap_safeguards": "checked-in mmap patch"
+  }
+}
+EOF
 
 CLI="${BUILD_DIR}/bin/llama-cli"
 "${CLI}" --version
@@ -107,15 +116,8 @@ for flag in '--offline' '--ctx-size' '--batch-size' '--ubatch-size' '--parallel'
         exit 1
     }
 done
-"${SERVER}" \
-    --offline --host 127.0.0.1 --port 18080 --alias origami-flag-check \
-    --load-mode mmap --gpu-layers all --override-tensor '^output=CPU' --fit off \
-    --ctx-size 262144 --batch-size 32 --ubatch-size 32 --parallel 1 \
-    --no-kv-unified --kv-offload --cache-type-k q8_0 --cache-type-v q8_0 \
-    --flash-attn on --no-context-shift --cache-ram 0 --no-cache-prompt \
-    --cache-reuse 0 --ctx-checkpoints 0 --no-cache-idle-slots --no-warmup \
-    --metrics --slots --perf --log-verbosity 4 \
-    --model /tmp/origami-flag-check-does-not-exist.gguf --version >/dev/null 2>&1
+# Do not render or execute the 262,144 candidate here. The pinned Q8_0 QSA
+# graph asserts during construction and lacks the profile's capability gate.
 "${CLI}" \
     --offline --load-mode mmap --gpu-layers all \
     --ctx-size 512 --batch-size 32 --ubatch-size 32 \

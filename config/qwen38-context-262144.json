@@ -1,12 +1,34 @@
 {
   "schema_version": "origami.context-profile.v1",
-  "name": "qwen38-native-262144-q8",
+  "name": "qwen38-native-262144-q8-main-f16-index-research",
+  "status": "blocked-pending-backend-capabilities",
   "runtime_revision": "bea3b12daee45876b0129a3602dc8f534ce30bf0",
   "model_manifest": "config/qwen38-flash-next-ud-iq1_s.json",
+  "execution_gate": {
+    "capability_manifest": "origami-context-capabilities.json",
+    "required_capabilities": [
+      {
+        "name": "qwen4exp_indexer_cache_coupled_and_reported",
+        "upstream_commit": "035e22731a7fd70b9854b3a2d64ec68e9b1a45d3"
+      },
+      {
+        "name": "qwen4exp_qsa_quantized_kv_rotation",
+        "upstream_commit": "0ac4b18025c2e255dd76252cd3b465683d08b257"
+      },
+      {
+        "name": "qwen4exp_large_graph_node_budget",
+        "upstream_commit": "c52ed2a0b0b865e82eb1b393106c48df1c39cb32"
+      },
+      {
+        "name": "qwen4exp_f16_indexer_cache_split",
+        "required_local_delta": "Pass separate indexer K/V types to llama_memory_hybrid_idx; use F16 for the indexer while main attention K/V remains Q8_0. The generic indexer cache may retain its unused F16 V side for the first implementation."
+      }
+    ]
+  },
   "server": {
     "host": "127.0.0.1",
     "port": 18080,
-    "alias": "origami-qwen38-262144",
+    "alias": "origami-qwen38-262144-research",
     "environment": {
       "GGML_METAL_NO_RESIDENCY": "1",
       "LLAMA_MMAP_PREFETCH": "0"
@@ -52,9 +74,8 @@
       "CPU  output buffer size",
       "size = 3264.00 MiB (262144 cells,  12 layers",
       "creating indexer KV cache, size = 262144 cells",
-      "size = 1224.00 MiB (262144 cells,  12 layers",
-      "K (q8_0)",
-      "V (q8_0)",
+      "Qwen4Exp indexer cache types: K = f16, V = f16",
+      "size = 2304.00 MiB (262144 cells,  12 layers",
       "Flash Attention enabled",
       "prompt cache is disabled",
       "context checkpoints disabled",
@@ -66,17 +87,34 @@
       "Insufficient Memory",
       "ggml_backend_sched_graph_compute_async failed",
       "llama_decode: failed",
-      "context size reduced"
+      "context size reduced",
+      "GGML_ASSERT(inp->self_k_rot == nullptr && inp->self_v_rot == nullptr)"
     ]
   },
   "memory": {
     "context_tokens": 262144,
+    "allocated_cells": 262144,
     "attention_layers": 12,
-    "cache_type": "q8_0",
+    "main_cache_type_k": "q8_0",
+    "main_cache_type_v": "q8_0",
+    "indexer_cache_type_k": "f16",
+    "indexer_cache_type_v": "f16-unused",
     "attention_kv_bytes": 3422552064,
-    "qsa_indexer_kv_bytes": 1283457024,
-    "total_kv_bytes": 4706009088,
-    "recurrent_state_observed_bytes": 130941977,
+    "qsa_indexer_kv_bytes": 2415919104,
+    "total_kv_bytes": 5838471168,
+    "gdn_recurrent_state_bytes": 117669888,
+    "ple_recurrent_state_bytes": 13271040,
+    "eager_cell_array_bytes": 25165824,
+    "persistent_payload_bytes": 5994577920,
+    "dense_qsa_graph_input_floor_bytes_at_ubatch_32": 440401920,
+    "context_and_graph_input_lower_bound_bytes": 6434979840,
+    "checkpoint_count": 0,
+    "checkpoint_copy_bytes": 0,
+    "pinned_default_32_checkpoint_copy_bytes": 4190109696,
+    "cpu_output_metal_virtual_envelope_bytes": 43013132800,
+    "metal_recommended_max_working_set_bytes": 55662788608,
+    "virtual_envelope_provisioning_lower_bound_bytes": 49448112640,
+    "virtual_envelope_provisioning_margin_bytes": 6214675968,
     "minimum_memory_pressure_free_percent": 15,
     "maximum_swap_growth_bytes": 0,
     "maximum_swapout_growth_pages": 0,

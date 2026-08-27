@@ -1,36 +1,9 @@
 {
-  "providers": {
-    "origami-local": {
-      "baseUrl": "http://127.0.0.1:18080/v1",
-      "api": "openai-completions",
-      "apiKey": "local",
-      "compat": {
-        "supportsDeveloperRole": false,
-        "supportsReasoningEffort": false,
-        "supportsUsageInStreaming": true,
-        "maxTokensField": "max_tokens",
-        "thinkingFormat": "qwen-chat-template",
-        "thinkingTokenBudgetField": "thinking_budget_tokens"
-      },
-      "models": [
-        {
-          "id": "origami-qwen38-262144",
-          "name": "Qwen3.8-Flash-Next UD-IQ1_S (native 262144)",
-          "reasoning": true,
-          "input": ["text"],
-          "contextWindow": 262144,
-          "maxTokens": 2048,
-          "samplingParams": {
-            "temperature": 0
-          },
-          "cost": {
-            "input": 0,
-            "output": 0,
-            "cacheRead": 0,
-            "cacheWrite": 0
-          }
-        }
-      ]
-    }
-  }
+  "schema_version": "origami.blocked-pi-profile.v1",
+  "status": "blocked-not-a-pi-configuration",
+  "model_id": "origami-qwen38-262144-research",
+  "proposed_context_window": 262144,
+  "proposed_max_tokens": 2048,
+  "reason": "No server profile is approved. The pinned Q8_0 QSA graph asserts during graph construction, and the required F16 indexer cache split does not exist in the pinned API.",
+  "required_server_profile": "config/qwen38-context-262144.json"
 }

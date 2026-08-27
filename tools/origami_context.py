@@ -57,6 +57,20 @@ def load_profile(path: Path) -> Dict[str, Any]:
         raise ContextError("native profile must declare exactly 262144 context tokens")
     if memory.get("total_kv_bytes") != memory.get("attention_kv_bytes", 0) + memory.get("qsa_indexer_kv_bytes", 0):
         raise ContextError("context profile KV byte ledger does not add up")
+    gate = profile.get("execution_gate")
+    if not isinstance(gate, dict) or not isinstance(gate.get("capability_manifest"), str):
+        raise ContextError("context profile needs an execution capability gate")
+    manifest_name = gate["capability_manifest"]
+    if Path(manifest_name).name != manifest_name:
+        raise ContextError("capability manifest must be a build-directory file name")
+    requirements = gate.get("required_capabilities")
+    if not isinstance(requirements, list) or not requirements:
+        raise ContextError("execution gate needs required capabilities")
+    names = [item.get("name") for item in requirements if isinstance(item, dict)]
+    if len(names) != len(requirements) or not all(isinstance(name, str) and name for name in names):
+        raise ContextError("each required capability needs a name")
+    if len(names) != len(set(names)):
+        raise ContextError("required capability names must be unique")
     args = server.get("arguments")
     if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
         raise ContextError("server.arguments must be an array of strings")
@@ -88,6 +102,39 @@ def model_entrypoint(profile: Dict[str, Any], model_root: Path) -> Path:
     return (model_root / str(manifest["entrypoint"])).resolve()
 
 
+def capability_gate_failures(profile: Dict[str, Any], manifest: Dict[str, Any]) -> List[str]:
+    failures = []
+    if manifest.get("schema_version") != "origami.backend-capabilities.v1":
+        failures.append("unsupported backend capability manifest schema")
+    if manifest.get("runtime_revision") != profile.get("runtime_revision"):
+        failures.append("capability manifest runtime revision does not match the profile")
+    provided = manifest.get("capabilities")
+    if not isinstance(provided, dict):
+        return failures + ["capability manifest needs a capabilities object"]
+    for requirement in profile["execution_gate"]["required_capabilities"]:
+        name = requirement["name"]
+        evidence = provided.get(name)
+        if not isinstance(evidence, str) or not evidence.strip():
+            failures.append(f"missing backend capability: {name}")
+            continue
+        expected_commit = requirement.get("upstream_commit")
+        if expected_commit is not None and evidence != expected_commit:
+            failures.append(f"backend capability {name} needs exact evidence {expected_commit}")
+    return failures
+
+
+def enforce_execution_gate(profile: Dict[str, Any], build: Path) -> None:
+    relative = profile["execution_gate"]["capability_manifest"]
+    manifest_path = build / relative
+    if not manifest_path.is_file():
+        names = ", ".join(item["name"] for item in profile["execution_gate"]["required_capabilities"])
+        raise ContextError(f"execution blocked: backend capability manifest is missing ({names})")
+    manifest = read_json(manifest_path)
+    failures = capability_gate_failures(profile, manifest)
+    if failures:
+        raise ContextError("execution blocked: " + "; ".join(failures))
+
+
 def server_executable(profile: Dict[str, Any], deps_root: Path) -> Path:
     revision = str(profile["runtime_revision"])
     build = deps_root / f"llama.cpp-{revision}" / "build-origami"
@@ -102,6 +149,7 @@ def server_executable(profile: Dict[str, Any], deps_root: Path) -> Path:
     patch_hash = hashlib.sha256(patch.read_bytes()).hexdigest()
     if not patch_marker.is_file() or patch_marker.read_text(encoding="utf-8").strip() != patch_hash:
         raise ContextError("pinned backend patch marker is missing or stale")
+    enforce_execution_gate(profile, build)
     return executable.resolve()
 
 
@@ -312,9 +360,22 @@ def base_url(state: Dict[str, Any]) -> str:
     return f"http://{state['host']}:{state['port']}"
 
 
+def status_action(profile: Dict[str, Any]) -> int:
+    gate = profile["execution_gate"]
+    print(json.dumps({
+        "name": profile["name"],
+        "status": profile.get("status"),
+        "runtime_revision": profile["runtime_revision"],
+        "required_capabilities": gate["required_capabilities"],
+        "configured_context_tokens": profile["memory"]["context_tokens"],
+        "validated_prompt_tokens": 0,
+    }, indent=2))
+    return 0
+
+
 def command_action(args: argparse.Namespace, profile: Dict[str, Any]) -> int:
-    model = model_entrypoint(profile, args.model_root.expanduser().resolve())
     executable = server_executable(profile, args.deps_root.expanduser().resolve())
+    model = model_entrypoint(profile, args.model_root.expanduser().resolve())
     environment, command = render_command(profile, executable, model, args.host, args.port)
     for key, value in environment.items():
         print(f"export {key}={shlex.quote(value)}")
@@ -330,8 +391,8 @@ def allocate_action(args: argparse.Namespace, profile: Dict[str, Any]) -> int:
         detail = "; ".join(f"PID {pid}: {command}" for pid, command in competing)
         raise ContextError("refusing to start a competing llama-server: " + detail)
 
-    model = model_entrypoint(profile, args.model_root.expanduser().resolve())
     executable = server_executable(profile, args.deps_root.expanduser().resolve())
+    model = model_entrypoint(profile, args.model_root.expanduser().resolve())
     environment, command = render_command(profile, executable, model, args.host, args.port)
     host = args.host or str(profile["server"]["host"])
     port = args.port if args.port is not None else int(profile["server"]["port"])
@@ -594,7 +655,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deps-root", type=Path, default=DEFAULT_DEPS)
     sub = parser.add_subparsers(dest="action", required=True)
 
-    command = sub.add_parser("command", help="print the exact launch command without starting a server")
+    sub.add_parser("status", help="print the research status and required backend capabilities")
+
+    command = sub.add_parser("command", help="print the command only after all execution gates pass")
     command.add_argument("model_root", type=Path)
     command.add_argument("--host")
     command.add_argument("--port", type=int)
@@ -624,6 +687,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         profile = load_profile(args.profile.expanduser().resolve())
+        if args.action == "status":
+            return status_action(profile)
         if args.action == "command":
             return command_action(args, profile)
         if args.action == "allocate":

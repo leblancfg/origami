@@ -65,8 +65,14 @@ def main_kv_bytes(cells: int, type_k: str = "f16", type_v: str = "f16") -> int:
     return N_QSA_LAYERS * cells * (row_bytes(type_k, ATTN_K_DIM) + row_bytes(type_v, ATTN_V_DIM))
 
 
-def index_kv_bytes(cells: int, type_k: str = "f16", type_v: str = "f16") -> int:
-    return N_QSA_LAYERS * cells * (row_bytes(type_k, INDEX_K_DIM) + row_bytes(type_v, INDEX_V_DIM))
+def index_kv_bytes(cells: int, type_k: str = "f16", type_v: str | None = "f16") -> int:
+    """Indexer cache payload.
+
+    The pinned generic cache always has a V side. Passing ``type_v=None`` models
+    the proposed key-only allocator; it does not describe the pinned runtime.
+    """
+    value_bytes = 0 if type_v is None else row_bytes(type_v, INDEX_V_DIM)
+    return N_QSA_LAYERS * cells * (row_bytes(type_k, INDEX_K_DIM) + value_bytes)
 
 
 def eager_cell_array_bytes(cells: int) -> int:
@@ -74,7 +80,7 @@ def eager_cell_array_bytes(cells: int) -> int:
 
 
 def qsa_graph_input_floor(cells: int, ubatch: int) -> int:
-    """Logical bytes for QSA's per-layer graph inputs, not the full scheduler buffer.
+    """Logical bytes for QSA's dense inputs, not the full scheduler buffer.
 
     For each QSA layer: cell_blk=4C, blk_cells=4C, blk_pos=4C, and
     bias=4*C*U because C is padded to a multiple of the compression ratio 4.
@@ -82,6 +88,13 @@ def qsa_graph_input_floor(cells: int, ubatch: int) -> int:
     if ubatch <= 0:
         raise ValueError("ubatch must be positive")
     return N_QSA_LAYERS * (12 * cells + 4 * cells * ubatch)
+
+
+def checkpoint_bytes(count: int) -> int:
+    """Logical recurrent-state copies retained by partial checkpoints."""
+    if count < 0:
+        raise ValueError("checkpoint count cannot be negative")
+    return count * RECURRENT_BUFFER_BYTES
 
 
 @dataclass(frozen=True)
@@ -94,6 +107,7 @@ class Ledger:
     ple_state: int
     cell_arrays: int
     qsa_input_floor: int
+    checkpoint_copies: int
 
     @property
     def persistent_payload(self) -> int:
@@ -103,18 +117,35 @@ class Ledger:
     def startup_lower_bound(self) -> int:
         return self.persistent_payload + self.qsa_input_floor
 
+    @property
+    def filled_context_lower_bound(self) -> int:
+        return self.startup_lower_bound + self.checkpoint_copies
 
-def ledger(requested: int, type_k: str = "f16", type_v: str = "f16", ubatch: int = 32) -> Ledger:
+
+def ledger(
+    requested: int,
+    type_k: str = "f16",
+    type_v: str = "f16",
+    ubatch: int = 32,
+    *,
+    index_type_k: str | None = None,
+    index_type_v: str | None = None,
+    index_key_only: bool = False,
+    checkpoints: int = 0,
+) -> Ledger:
     cells = pad_context(requested)
+    idx_k = type_k if index_type_k is None else index_type_k
+    idx_v = None if index_key_only else (type_v if index_type_v is None else index_type_v)
     return Ledger(
         requested=requested,
         cells=cells,
         main_kv=main_kv_bytes(cells, type_k, type_v),
-        index_kv=index_kv_bytes(cells, type_k, type_v),
+        index_kv=index_kv_bytes(cells, idx_k, idx_v),
         gdn_state=GDN_STATE_BYTES,
         ple_state=PLE_CONV_BYTES,
         cell_arrays=eager_cell_array_bytes(cells),
         qsa_input_floor=qsa_graph_input_floor(cells, ubatch),
+        checkpoint_copies=checkpoint_bytes(checkpoints),
     )
 
 
@@ -137,12 +168,30 @@ def main() -> int:
     parser.add_argument("contexts", metavar="N", type=int, nargs="*", default=[250_000, 262_144, 500_000, 1_000_000])
     parser.add_argument("--type-k", choices=KV_TYPES, default="f16")
     parser.add_argument("--type-v", choices=KV_TYPES, default="f16")
+    parser.add_argument("--index-type-k", choices=KV_TYPES)
+    parser.add_argument("--index-type-v", choices=KV_TYPES)
+    parser.add_argument("--index-key-only", action="store_true")
+    parser.add_argument("--checkpoints", type=int, default=0)
     parser.add_argument("--ubatch", type=int, default=32)
     args = parser.parse_args()
 
-    print(f"K={args.type_k}, V={args.type_v}, ubatch={args.ubatch}")
+    idx_k = args.index_type_k or args.type_k
+    idx_v = "none" if args.index_key_only else (args.index_type_v or args.type_v)
+    print(
+        f"main K={args.type_k}, main V={args.type_v}, "
+        f"index K={idx_k}, index V={idx_v}, ubatch={args.ubatch}, checkpoints={args.checkpoints}"
+    )
     for requested in args.contexts:
-        item = ledger(requested, args.type_k, args.type_v, args.ubatch)
+        item = ledger(
+            requested,
+            args.type_k,
+            args.type_v,
+            args.ubatch,
+            index_type_k=args.index_type_k,
+            index_type_v=args.index_type_v,
+            index_key_only=args.index_key_only,
+            checkpoints=args.checkpoints,
+        )
         factor = yarn_factor(requested)
         rope = "native" if factor is None else f"static YaRN factor {factor}"
         print(f"\ncontext {requested:,} -> {item.cells:,} allocated cells; {rope}")
@@ -153,8 +202,10 @@ def main() -> int:
             ("PLE recurrent", item.ple_state),
             ("eager cell-array payload", item.cell_arrays),
             ("persistent payload", item.persistent_payload),
-            ("QSA graph-input floor", item.qsa_input_floor),
+            ("dense QSA input floor", item.qsa_input_floor),
             ("startup lower bound", item.startup_lower_bound),
+            ("checkpoint copies", item.checkpoint_copies),
+            ("filled-context lower bound", item.filled_context_lower_bound),
         ):
             print(f"  {label:27s} {fmt_bytes(value)}")
     return 0

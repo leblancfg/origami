@@ -1,169 +1,129 @@
-# Qwen3.8 native long-context profile
+# Qwen3.8 long-context integration record
 
-## Status
+## Operational status
 
-The pinned model declares a native training context of 262,144 tokens. The profile in [`config/qwen38-context-262144.json`](../config/qwen38-context-262144.json) describes a single-slot server at that capacity with Q8_0 K and V caches. It has not been allocated on the 64 GiB test host. The user's temporary 16,384-token server was active during this work, so no second server or 262,144-token allocation was started.
+No checked-in long-context profile is launchable. The short 512-token PoC remains the only approved llama.cpp command in this repository.
 
-The current evidence reaches a 977-token prompt and a maximum observed sequence length of 980 tokens. It does not validate a 16,384-token prompt, much less the model's native limit. Server allocation, `/health`, and a declared `n_ctx` prove configured capacity. Only a completed prompt stage proves operation at that length.
+The two integrated reports measured different parts of the same path. The 262,144-token profile chose Q8_0 for both attention and indexer caches. At pinned llama.cpp commit `bea3b12daee45876b0129a3602dc8f534ce30bf0`, that choice creates Hadamard cache-rotation tensors and then reaches an unconditional QSA assertion that requires those tensors to be null. The byte ledger is correct, but the graph cannot be constructed. Disabling rotation would make an untested lossy path and is not an acceptable workaround.
 
-## Exact native server profile
+The evidence supports five separate findings:
 
-Stop the temporary server before using this command. `scripts/context-profile.sh allocate` refuses to run while any `llama-server` process is present.
+| Question | Finding |
+|---|---|
+| Configured allocation feasibility | Plausible, not proved. The proposed Q8_0-main/F16-indexer context and dense-input lower bound is 6,434,979,840 bytes. Adding the measured 43,013,132,800-byte CPU-output Metal virtual envelope leaves 6,214,675,968 bytes under Metal's recommendation. Virtual mappings are not resident bytes, so this is a provisioning screen rather than an RSS prediction or a no-go proof. |
+| Graph-construction feasibility | Failed at the pin for Q8_0. `build_attn_qsa()` asserts on quantized-cache rotation. The pin also omits Qwen4Exp from the large graph-node budget. Later PR commits fix both defects, but Origami has not built or run them. |
+| Filled-context memory safety | Unknown. No 262,144-cell allocation or filled prompt has run. The lower bound omits the full scheduler allocation, active mmap pages, tree nodes, output/repack buffers, and OS demand. |
+| Long-prompt operation | Unknown. The longest observed prompt is 977 tokens and the largest observed sequence length is 980. The pinned graph builds twelve dense `F32[C,U]` QSA bias inputs and fills them on the host for every microbatch. |
+| Correctness certification | Failed by lack of evidence. The pin omits indexer state from save/restore, keeps PLE history on the model, and has no quantized-cache, native-boundary, or YaRN parity result. |
+
+A healthy `/health` response and `n_ctx = 262144` would prove allocation and declared capacity only. They would not change the final three findings.
+
+## Fail-closed profile
+
+[`config/qwen38-context-262144.json`](../config/qwen38-context-262144.json) retains the exact one-slot server arguments, telemetry thresholds, cache ledger, and staged prompt plan. It now requires a build-local `origami-context-capabilities.json`. The pinned bootstrap emits a capability manifest that contains only the mmap safeguards, so every execution action refuses the native profile.
 
 ```sh
-STATE=/private/tmp/origami-context-262144
-MODEL=/path/to/UD-IQ1_S
+# Safe and non-invasive.
+scripts/context-profile.sh status
 
-# Print the command without starting a server.
-scripts/context-profile.sh command "$MODEL"
-
-# Start one owned server, allocate its caches, enforce the memory gates, and
-# stop after health and startup-log checks. The server remains running.
-scripts/context-profile.sh allocate "$MODEL" --state-dir "$STATE"
-
-# Repeat the allocation checks without generation.
-scripts/context-profile.sh health --state-dir "$STATE"
-
-# Run increasing token-ID prompts. Any gate failure terminates the owned server.
-scripts/context-profile.sh probe --state-dir "$STATE" \
-  --output "$STATE/probe.json"
-
-scripts/context-profile.sh stop --state-dir "$STATE"
+# Refuses before it prints a shell command or starts a server.
+scripts/context-profile.sh command /path/to/UD-IQ1_S
+scripts/context-profile.sh allocate /path/to/UD-IQ1_S \
+  --state-dir /private/tmp/origami-context-262144
 ```
 
-The rendered server command contains these material settings:
+The gate requires these named capabilities:
+
+1. `qwen4exp_indexer_cache_coupled_and_reported`, corresponding to upstream `035e22731a7fd70b9854b3a2d64ec68e9b1a45d3`.
+2. `qwen4exp_qsa_quantized_kv_rotation`, corresponding to `0ac4b18025c2e255dd76252cd3b465683d08b257`.
+3. `qwen4exp_large_graph_node_budget`, corresponding to `c52ed2a0b0b865e82eb1b393106c48df1c39cb32`.
+4. `qwen4exp_f16_indexer_cache_split`, an Origami delta that is not present at the inspected PR head.
+
+An upstream capability entry must contain the exact fixing commit recorded by the profile. The local split needs nonempty build evidence, and the manifest's runtime revision must match the profile. Revision and patch markers remain mandatory. The gate is an execution interlock, not a correctness certificate.
+
+The Pi file at [`config/pi-model-origami-262144.json`](../config/pi-model-origami-262144.json) is intentionally not a Pi provider configuration. Publishing a client-side 262,144-token budget before a server passes the gates would turn an unavailable backend into an apparently selectable model.
+
+## Upstream trace
+
+Origami pins `bea3b12`. The later PR #27742 head inspected for this integration is `0b19188e9`; it includes the following post-pin changes:
+
+| Commit | Effect on this review |
+|---|---|
+| `7fee670a9` | Keeps the Qwen4Exp top-k mask implementation architecture-local. |
+| `035e22731` | Introduces `llama_memory_hybrid_idx`, couples indexer and attention cell layouts, and includes indexer memory in the breakdown. |
+| `cfbdc0a50` | Saves and restores indexer KV state. |
+| `d22d2be2b` | Moves PLE n-gram history into context state and serializes it. |
+| `d4a943f9a` | Cleans up Qwen4Exp comments and image-token handling without closing a long-context gate. |
+| `0ac4b1802` | Applies and reverses quantized-cache Hadamard rotations in the QSA attention path, removing the pinned assertion. |
+| `c52ed2a0b` | Gives Qwen4Exp the large graph-node budget used by other large hybrid graphs. |
+| `6a69a0c12` | Removes an unused Qwen4Exp variable that breaks warning-as-error builds. |
+| `ef9fa1ba1` | Quantizes large tensors in row bands; it does not change context memory. |
+| `5674c73aa` | Segments fused QKV for tensor split; it does not split main and indexer cache types. |
+| `24ea62df4` | Fixes PLE history erasure during `seq_rm(-1)` and a fatal-warning build failure. |
+| `0b19188e9` | Adds the explicit include needed by the Hadamard helper. |
+
+Later commits repair real state and graph defects, but they add neither a split indexer cache type nor a bounded sparse QSA scheduler allocation.
+
+## Smallest credible native runtime delta
+
+Use the later Qwen4Exp fixes as the base. Keep main attention K and V at Q8_0, while keeping the routing indexer's K at F16. `llama_memory_hybrid_idx` currently passes the main `type_k` and `type_v` to its generic indexer `llama_kv_cache`, so the public settings cannot express that split.
+
+The smallest first implementation is model-local:
+
+1. Add separate indexer K/V types to `llama_memory_hybrid_idx`.
+2. Select F16 indexer K and F16 indexer V for Qwen4Exp while retaining Q8_0 main attention K/V.
+3. Emit an explicit cache-type log marker and account for the indexer in `memory_breakdown()`.
+4. Keep checkpoints, prompt reuse, context shift, and the RAM prompt cache disabled during allocation and long-prompt probes.
+
+This version still pays for a 256-element F16 indexer V tensor that QSA does not use. Removing it needs a key-only indexer allocator or a QSA-specific cache API; the generic KV allocator always creates both sides. A key-only cache would reduce native indexer payload from 2,415,919,104 to 805,306,368 bytes. That allocator improvement is useful but not required for the first guarded allocation attempt.
+
+The delta must retain the later cache-rotation and graph-budget fixes. Applying only the F16 split to `bea3b12` would leave the main Q8_0 attention assertion in place.
+
+## Native memory ledger
+
+At 262,144 cells and microbatch 32:
+
+| Configuration | Main attention KV | Indexer K/unused V | Persistent context | Dense QSA input floor | Context plus input floor |
+|---|---:|---:|---:|---:|---:|
+| Pinned F16 | 6,442,450,944 | 2,415,919,104 | 9,014,476,800 | 440,401,920 | 9,454,878,720 |
+| Integrated Q8_0/Q8_0 profile, graph-invalid at pin | 3,422,552,064 | 1,283,457,024 | 4,862,115,840 | 440,401,920 | 5,302,517,760 |
+| Proposed Q8_0 main, F16 indexer | 3,422,552,064 | 2,415,919,104 | 5,994,577,920 | 440,401,920 | 6,434,979,840 |
+| Proposed Q8_0 main, F16 key-only indexer | 3,422,552,064 | 805,306,368 | 4,383,965,184 | 440,401,920 | 4,824,367,104 |
+
+Persistent context includes 117,669,888 bytes of GDN state, 13,271,040 bytes of PLE state, and 25,165,824 bytes of eager host cell arrays. It excludes allocator overhead and occupied-cell tree nodes.
+
+The dense QSA figure is an exact logical input payload, not the complete scheduler buffer:
 
 ```text
-GGML_METAL_NO_RESIDENCY=1
-LLAMA_MMAP_PREFETCH=0
-
-llama-server --offline --host 127.0.0.1 --port 18080 \
-  --alias origami-qwen38-262144 --model MODEL.gguf \
-  --load-mode mmap --gpu-layers all --override-tensor '^output=CPU' \
-  --fit off --ctx-size 262144 --batch-size 32 --ubatch-size 32 \
-  --parallel 1 --no-kv-unified --kv-offload \
-  --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on \
-  --no-context-shift --cache-ram 0 --no-cache-prompt --cache-reuse 0 \
-  --ctx-checkpoints 0 --no-cache-idle-slots --no-warmup \
-  --jinja --metrics --slots --perf --log-verbosity 4
+12 * (12C + 4CU) = 440,401,920 bytes, C=262144, U=32
 ```
 
-`--fit off` makes an allocation failure visible instead of changing placement. The pinned fit code does not reduce an explicitly set context, but disabling fit also prevents an automatic layer-placement change. `--parallel 1` gives the one slot the whole context. `--no-context-shift` makes the server stop at the boundary instead of discarding old tokens. Native 262,144 operation uses the model's RoPE metadata unchanged, so this profile has no YaRN or other RoPE override.
+At the 512-cell PoC, the actual scheduler reserve was much larger than this term. The guarded allocation must record Metal and CPU scheduler buffers at the target context.
 
-The two mmap safeguards and CPU output placement are the same settings that passed the short PoC. CPU output keeps the 28.8 GB PLE table out of the unsafe Metal mmap envelope. The safeguards suppress eager prefetch and Metal residency requests. They do not impose a physical cache ceiling on routed weights or the PLE table.
+Each recurrent checkpoint copies 130,940,928 logical bytes. The pinned default maximum of 32 adds 4,190,109,696 bytes. The research profile sets `--ctx-checkpoints 0`. It also sets `--cache-ram 0`, `--no-cache-prompt`, and `--cache-reuse 0`.
 
-## KV and QSA accounting
+The measured CPU-output Metal mapping envelope is 43,013,132,800 bytes. It is virtual address coverage for no-copy mappings. Adding it to committed context buffers is conservative for provisioning, while treating the total as physical occupancy is incorrect. Allocation telemetry and a filled prompt are required to settle memory safety.
 
-Qwen4Exp has 12 attention layers among its 48 layers. Each attention token stores 512 K elements and 512 V elements. QSA also stores an indexer cache with 128 K elements and 256 V elements on those 12 layers. The pinned hybrid-memory constructor passes `--cache-type-k` and `--cache-type-v` to both caches. There is no separate QSA cache-type flag.
+## Native proof sequence after the capability gate
 
-Q8_0 stores each 32-element row block in 34 bytes. At 262,144 cells:
+A capability-complete build may run the existing guarded sequence:
 
-| Allocation | Bytes | GiB |
-|---|---:|---:|
-| Attention K and V | 3,422,552,064 | 3.1875 |
-| QSA indexer K and V | 1,283,457,024 | 1.1953125 |
-| Total KV | 4,706,009,088 | 4.3828125 |
+1. `allocate` checks shards, revision and patch markers, the capability manifest, startup logs, `/health`, `/props`, and system memory counters.
+2. `health` repeats non-generating checks against the owned PID.
+3. `probe` sends increasing raw-token prompts through 258,048 tokens. Any pressure, swap, timeout, HTTP, token-count, or backend-log failure terminates the owned process group.
+4. A separate boundary probe must evaluate positions 262,143 and 262,144 before the profile can claim the full native window.
 
-The active 16,384-token server uses F16 and reports 384 MiB for attention plus 144 MiB for the QSA indexer. F16 would scale to 8.25 GiB at native context. Q4_0 would use 2.3203125 GiB. Q8_0 is the initial profile because it halves the F16 allocation without starting with a 4-bit cache. The cache quantization still needs output-quality testing.
+Passing these steps establishes allocation, filled-context safety on the measured host, and basic long-prompt operation. Correctness still needs logits, selected QSA blocks, and greedy-token parity against a trusted Qwen4Exp implementation. Tests must cover fresh prompts, rewrites, state restore, and multi-turn reuse.
 
-Quantized V requires Flash Attention in the pinned context constructor. The profile sets `--flash-attn on` rather than relying on `auto`. The pinned Metal source includes Q8_0 Flash Attention kernels for the model's 256 by 256 attention heads, and 128 and 256 are divisible by Q8_0's 32-element block. Startup must report both `flash_attn = on` and `Flash Attention enabled`.
+## Static-YaRN research profiles
 
-QSA limits the selected attention width to `min(n_kv, 2048 + ratio - 1)`, with ratio 4 for these layers. It does not make the caches bounded: attention and indexer KV still allocate one cell per context token. The current graph also creates an F32 `[n_kv, n_ubatch]` QSA bias for every QSA layer and fills it on the host. With a microbatch of 32, those 12 bias tensors alone represent 384 MiB at 262,144 cells and about 1.43 GiB at one million cells. The allocation probe must measure actual compute buffers rather than treating the KV table as the whole context cost.
+The official model guidance uses static YaRN only above the native 262,144-token range. Origami records two independent, nonlaunchable experiments:
 
-## Prompt cache and checkpoint overhead
+- [`qwen38-context-yarn-524288-research.json`](../config/qwen38-context-yarn-524288-research.json): 524,288 tokens, factor 2.
+- [`qwen38-context-yarn-1000000-research.json`](../config/qwen38-context-yarn-1000000-research.json): 1,000,000 requested tokens, factor 4, with 1,000,192 allocated cells after llama.cpp padding.
 
-The temporary server already uses `--cache-ram 0`, so the bounded server prompt cache is disabled. Its request default still permits slot-prefix reuse. More importantly, the default 32 context checkpoints remain enabled. Qwen4Exp's recurrent memory cannot support partial sequence removal, and the log shows three checkpoints per chat request at 124.876 MiB each. The configured maximum could retain about 3.90 GiB per slot.
+Each profile preserves `original_max_position_embeddings = 262144`. Neither changes the native profile or supplies a Pi model. They need independent factor-specific RoPE parity for core attention and the pooled indexer, allocation evidence, prompts crossing 262,144, and retrieval/generation comparison. Static YaRN can affect short-context quality, so one factor cannot stand in for the other.
 
-The native profile sets all of the following:
+## Recommendation
 
-- `--cache-ram 0` to disable the extra RAM prompt cache
-- `--no-cache-prompt` and `--cache-reuse 0` to keep staged probes independent
-- `--ctx-checkpoints 0` to remove recurrent checkpoint copies
-- `--no-cache-idle-slots` to avoid an option that requires the RAM cache
-- no `--slot-save-path`, so no serialized KV state is written
-
-These choices trade repeat-request speed and checkpoint rollback for a smaller, easier-to-account allocation. They do not remove the live KV and recurrent state needed by the active slot.
-
-## Staged proof and abort behavior
-
-`allocate` performs model shard size checks, verifies the pinned revision marker, rejects every existing `llama-server`, and starts the server in a new process group. It samples macOS system telemetry while waiting. A pass requires:
-
-- `/health` returns `{"status":"ok"}`
-- `/props` reports `n_ctx = 262144`
-- `/v1/models` is readable
-- logs prove the two mmap safeguards, CPU output, Q8_0 attention and indexer caches, forced Flash Attention, disabled prompt cache, and disabled checkpoints
-- logs contain no compute, scheduler, decode, Metal out-of-memory, or context-reduction marker
-
-The default hard gates are a memory-pressure free percentage of at least 15%, zero growth in swap used, zero swap-out pages, and no more than 2 GiB growth in compressor occupancy. The gates compare counters with the allocation or probe baseline, so pre-existing swap does not masquerade as inference growth. A failing allocation terminates the new process group.
-
-`probe` accepts only a server PID recorded by a passing `allocate` state. It sends raw token-ID prompts with one generated token at these lengths:
-
-```text
-1024, 4096, 16384, 32768, 65536, 131072, 196608, 245760, 258048
-```
-
-Each request disables prompt reuse. A stage passes only when the response reports at least the requested prompt length and `llamacpp:n_tokens_max` reaches it. The monitor samples every 0.25 seconds. A memory gate, swap gate, request timeout, HTTP failure, or missing token-count proof terminates the recorded server. The tool validates the PID's executable, model path, port, and process-group ownership before signaling it.
-
-System counters are global. Another memory-intensive process can correctly trip a gate even if llama.cpp did not cause the pressure. Run the probe on an otherwise quiet host and retain the JSON record and server log.
-
-## Current temporary server
-
-The active temporary process was inspected without submitting another prompt. Its command configures 16,384 tokens, one slot, F16 caches, `--cache-ram 0`, automatic Flash Attention, CPU output, and both lazy-mmap environment variables. Its startup log proves:
-
-- model metadata and `n_ctx_train`: 262,144
-- allocated `n_ctx` and slot context: 16,384
-- Flash Attention resolved on
-- attention KV: 384 MiB F16
-- QSA indexer KV: 144 MiB F16
-- recurrent state: 124.88 MiB
-- context checkpoints: 32 maximum, 8,192 minimum spacing
-
-The `/props` snapshot reported `n_ctx = 16384`. Metrics reported 1,943 prompt tokens processed, 169 predicted tokens, and `llamacpp:n_tokens_max = 980`. The longest log record was a 977-token prompt followed by generation to sequence length 980. Later requests were shorter. `/health` was healthy, and the sampled server was idle.
-
-At the snapshot, system memory pressure reported 80% free and system swap already had about 7.04 GiB in use. `vmmap` reported a 1.5 GiB physical footprint for the server, 67.3 GiB of mapped files with about 129 MiB resident, and 1.5 GiB swapped writable regions. These idle values do not account for all file-backed pages that Metal may make resident during a long prompt.
-
-The temporary Pi profile declares `contextWindow: 16384` and `maxTokens: 2048`, matching that server. It does not declare 262,144. [`config/pi-model-origami-262144.json`](../config/pi-model-origami-262144.json) is a replacement example for use only with the native server. Its `contextWindow` is 262,144. Pi's declaration controls client-side token budgeting and compaction; it cannot enlarge the server.
-
-## Honest path to 524,288 and 1,000,000
-
-The official model configuration uses default mRoPE, a 10,000,000 base, and `max_position_embeddings = 262144`. The official model card calls 262,144 native and recommends static YaRN beyond that point. It gives factor 2 for a typical 524,288-token workload and factor 4 for the advertised one-million-token mode, with `original_max_position_embeddings = 262144`. Static YaRN can reduce short-context quality, so these must be separate profiles rather than changes to the native default.
-
-[`config/qwen38-context-yarn-research.json`](../config/qwen38-context-yarn-research.json) records both unvalidated targets without making either one launchable through the native profile tool. The matching pinned llama.cpp flags would be:
-
-```text
-# 524,288 configured cells
---ctx-size 524288 \
---override-kv qwen4exp.context_length=int:524288 \
---rope-scaling yarn --rope-scale 2 --yarn-orig-ctx 262144
-
-# Official one-million-token ceiling, not 1,048,576
---ctx-size 1000000 \
---override-kv qwen4exp.context_length=int:1000000 \
---rope-scaling yarn --rope-scale 4 --yarn-orig-ctx 262144
-```
-
-The metadata override is necessary in this pinned server. `server-context.cpp` caps each slot to `n_ctx_train`; setting only `--ctx-size` and YaRN would allocate a larger context and then expose a 262,144-token slot. The override changes the server's declared training ceiling, while `--yarn-orig-ctx 262144` preserves the actual YaRN origin. The pinned parser accepts the `int:` override for the GGUF's U32 context key. For one million, llama.cpp pads the internal allocation to a 256-cell boundary and the server cap exposes the requested 1,000,000 cells.
-
-These flags are a configuration recipe, not a validated backend. Before either profile can be called supported, it needs:
-
-1. a dedicated config and Pi declaration that name it as YaRN rather than native;
-2. startup allocation proof with exact cache and compute-buffer logs;
-3. Q8_0 quality comparison, followed by an explicitly lossy Q4_0 cache profile only if memory requires it;
-4. staged prompts that cross 262,144 and reach the target range;
-5. long-context retrieval or passkey tests against a trusted implementation, not only repeated synthetic token IDs.
-
-At 524,288 cells, Q8_0 attention plus indexer KV is 8.765625 GiB; Q4_0 is 4.640625 GiB. At 1,000,000 cells, those values are about 16.72 GiB and 8.85 GiB. The latter also carries the QSA graph costs described above. The mmap weight path remains unbounded, so fitting the nominal KV allocation does not establish safe operation on 64 GiB.
-
-The pinned Qwen4Exp support is experimental and absent from the comparison `master` revision recorded in the PoC decision. Its architecture tests cover a small synthetic QSA graph, not YaRN at 524,288 or one million, and no independent resident oracle has validated the current GGUF. Generic `ggml_rope_multi` receives YaRN parameters, but Qwen4Exp has no model-specific long-context regression. The host-side QSA map and bias construction, unbounded routed-weight residency, and lack of end-to-end long-prompt telemetry are the smallest concrete backend gaps to close before advertising either extended window.
-
-## Sources inspected
-
-- Pinned `llama-server --help` at `bea3b12daee45876b0129a3602dc8f534ce30bf0`
-- `common/arg.cpp` for context, KV, Flash Attention, checkpoint, prompt-cache, and YaRN parsing
-- `src/llama-context.cpp` for context padding, Flash Attention requirements, and YaRN defaults
-- `src/llama-model.cpp` for the Qwen4Exp hybrid attention, recurrent, and indexer caches
-- `src/models/qwen4exp.cpp` and `src/llama-kv-cache.cpp` for QSA width, tensors, and host setup
-- `tools/server/server-context.cpp` for slot capping, context shift, checkpoints, and oversized-prompt rejection
-- Metal `kernels/fa.metal` for Q8_0 Flash Attention head-size specializations
-- [Official Qwen3.8-Flash-Next model card](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), including its native and static-YaRN recipes
-- Pi `docs/models.md` for `contextWindow` and `maxTokens` semantics
+Continue using the 512-token pinned PoC only for reference work. Do not start the checked-in 262,144, 524,288, or 1,000,000 profiles. For native 262,144 research, implement the four required capabilities, beginning with the later PR fixes and the Q8_0-main/F16-indexer split. Then run the guarded allocation and staged prompt sequence on an otherwise quiet 64 GB host. Keep checkpoints disabled. Do not publish the Pi profile until filled-context safety, long-prompt operation, and correctness have separate passing records.

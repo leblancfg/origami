@@ -10,7 +10,7 @@
 
 ## Reference implementations
 
-- [llama.cpp Qwen4Exp support, PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742), pinned for the proof of concept at commit [`bea3b12daee45876b0129a3602dc8f534ce30bf0`](https://github.com/ggml-org/llama.cpp/commit/bea3b12daee45876b0129a3602dc8f534ce30bf0)
+- [llama.cpp Qwen4Exp support, PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742), pinned for the proof of concept at commit [`bea3b12daee45876b0129a3602dc8f534ce30bf0`](https://github.com/ggml-org/llama.cpp/commit/bea3b12daee45876b0129a3602dc8f534ce30bf0); later comparison head [`0b19188e9`](https://github.com/ggml-org/llama.cpp/commit/0b19188e9), including quantized QSA rotation `0ac4b1802` and graph-budget fix `c52ed2a0b`
 - [Unsloth llama.cpp Qwen4Exp branch, PR #111](https://github.com/unslothai/llama.cpp/pull/111)
 - [Transformers Qwen4Exp implementation](https://github.com/huggingface/transformers/pull/48337)
 - [vLLM deployment recipe](https://recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next)

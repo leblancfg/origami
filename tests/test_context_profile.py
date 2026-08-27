@@ -50,7 +50,7 @@ class ContextProfileTests(unittest.TestCase):
             "LLAMA_MMAP_PREFETCH": "0",
         })
 
-    def test_q8_attention_and_qsa_cache_ledger_is_byte_exact(self):
+    def test_q8_main_and_f16_indexer_ledger_is_byte_exact(self):
         memory = self.profile["memory"]
         ctx = memory["context_tokens"]
         layers = memory["attention_layers"]
@@ -60,10 +60,14 @@ class ContextProfileTests(unittest.TestCase):
             return elements // 32 * 34
 
         attention = ctx * layers * (q8_row(512) + q8_row(512))
-        indexer = ctx * layers * (q8_row(128) + q8_row(256))
+        indexer = ctx * layers * (2 * 128 + 2 * 256)
         self.assertEqual(attention, 3422552064)
-        self.assertEqual(indexer, 1283457024)
+        self.assertEqual(indexer, 2415919104)
         self.assertEqual(memory["total_kv_bytes"], attention + indexer)
+        self.assertEqual(memory["persistent_payload_bytes"], 5994577920)
+        self.assertEqual(memory["dense_qsa_graph_input_floor_bytes_at_ubatch_32"], 440401920)
+        self.assertEqual(memory["context_and_graph_input_lower_bound_bytes"], 6434979840)
+        self.assertEqual(memory["pinned_default_32_checkpoint_copy_bytes"], 4190109696)
 
     def test_log_proof_requires_capacity_qsa_flash_and_safeguards(self):
         text = "\n".join(self.profile["server"]["required_log_markers"])
@@ -104,27 +108,64 @@ class ContextProfileTests(unittest.TestCase):
         )
         self.assertEqual(metrics["llamacpp:n_tokens_max"], 980)
 
-    def test_pi_sample_declares_native_window(self):
+    def test_pi_sample_is_deliberately_not_loadable(self):
         config = json.loads((ROOT / "config" / "pi-model-origami-262144.json").read_text())
-        model = config["providers"]["origami-local"]["models"][0]
-        self.assertEqual(model["contextWindow"], 262144)
-        self.assertLess(model["maxTokens"], model["contextWindow"])
+        self.assertEqual(config["status"], "blocked-not-a-pi-configuration")
+        self.assertEqual(config["proposed_context_window"], 262144)
+        self.assertNotIn("providers", config)
 
-    def test_yarn_targets_remain_explicitly_unvalidated(self):
-        research = json.loads((ROOT / "config" / "qwen38-context-yarn-research.json").read_text())
-        self.assertEqual(research["status"], "research-only-not-launchable")
-        target_500k, target_1m = research["targets"]
-        self.assertEqual(target_500k["context_tokens"], 524288)
-        self.assertEqual(target_500k["yarn_factor"], 2.0)
-        self.assertEqual(target_500k["q8_0_total_kv_bytes"], 2 * self.profile["memory"]["total_kv_bytes"])
-        self.assertEqual(target_1m["context_tokens"], 1000000)
-        self.assertEqual(target_1m["yarn_factor"], 4.0)
-        for target in research["targets"]:
+    def test_yarn_targets_are_separate_and_unvalidated(self):
+        index = json.loads((ROOT / "config" / "qwen38-context-yarn-research.json").read_text())
+        self.assertEqual(index["status"], "research-only-not-launchable")
+        self.assertEqual(len(index["profiles"]), 2)
+        profiles = [json.loads((ROOT / item).read_text()) for item in index["profiles"]]
+        target_500k, target_1m = profiles
+        self.assertEqual(target_500k["official_recipe"]["context_tokens"], 524288)
+        self.assertEqual(target_500k["official_recipe"]["yarn_factor"], 2.0)
+        self.assertEqual(target_500k["memory_at_ubatch_32"]["all_q8_0_kv_bytes_unapproved"], 9412018176)
+        self.assertEqual(target_500k["memory_at_ubatch_32"]["q8_0_main_f16_index_kv_bytes_candidate"], 11676942336)
+        self.assertEqual(target_1m["official_recipe"]["context_tokens"], 1000000)
+        self.assertEqual(target_1m["official_recipe"]["yarn_factor"], 4.0)
+        self.assertEqual(target_1m["memory_at_ubatch_32"]["allocated_cells"], 1000192)
+        self.assertEqual(target_1m["memory_at_ubatch_32"]["all_q8_0_kv_bytes_unapproved"], 17955446784)
+        self.assertEqual(target_1m["memory_at_ubatch_32"]["q8_0_main_f16_index_kv_bytes_candidate"], 22276276224)
+        for target in profiles:
+            self.assertEqual(target["status"], "research-only-not-launchable")
             self.assertEqual(target["validated_prompt_tokens"], 0)
             self.assertIsNone(target["pi_context_window"])
-            delta = target["argument_delta"]
-            self.assertIn("qwen4exp.context_length=int:" + str(target["context_tokens"]), delta)
-            self.assertIn("--yarn-orig-ctx", delta)
+            recipe = target["pinned_llama_cpp_argument_recipe"]
+            tokens = target["official_recipe"]["context_tokens"]
+            self.assertIn("qwen4exp.context_length=int:" + str(tokens), recipe)
+            self.assertIn("--yarn-orig-ctx", recipe)
+
+    def test_execution_gate_rejects_the_pinned_capability_set(self):
+        pinned = {
+            "schema_version": "origami.backend-capabilities.v1",
+            "runtime_revision": self.profile["runtime_revision"],
+            "capabilities": {"lazy_mmap_safeguards": "checked-in patch"},
+        }
+        failures = CONTEXT.capability_gate_failures(self.profile, pinned)
+        names = {item["name"] for item in self.profile["execution_gate"]["required_capabilities"]}
+        self.assertEqual(len(failures), len(names))
+        for name in names:
+            self.assertTrue(any(name in failure for failure in failures))
+
+    def test_execution_gate_accepts_named_evidence_only_at_matching_revision(self):
+        manifest = {
+            "schema_version": "origami.backend-capabilities.v1",
+            "runtime_revision": self.profile["runtime_revision"],
+            "capabilities": {
+                item["name"]: item.get("upstream_commit", "local source and test evidence")
+                for item in self.profile["execution_gate"]["required_capabilities"]
+            },
+        }
+        self.assertEqual(CONTEXT.capability_gate_failures(self.profile, manifest), [])
+        first = self.profile["execution_gate"]["required_capabilities"][0]
+        manifest["capabilities"][first["name"]] = "wrong evidence"
+        self.assertTrue(any("exact evidence" in item for item in CONTEXT.capability_gate_failures(self.profile, manifest)))
+        manifest["capabilities"][first["name"]] = first["upstream_commit"]
+        manifest["runtime_revision"] = "wrong"
+        self.assertTrue(any("revision" in item for item in CONTEXT.capability_gate_failures(self.profile, manifest)))
 
     def test_pinned_server_help_contains_every_profile_flag_when_available(self):
         revision = self.profile["runtime_revision"]
@@ -145,8 +186,18 @@ class ContextProfileTests(unittest.TestCase):
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("status", completed.stdout)
         self.assertIn("allocate", completed.stdout)
         self.assertIn("probe", completed.stdout)
+
+        status = subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "origami_context.py"), "status"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+        )
+        self.assertEqual(status.returncode, 0, status.stderr)
+        value = json.loads(status.stdout)
+        self.assertEqual(value["status"], "blocked-pending-backend-capabilities")
+        self.assertEqual(value["validated_prompt_tokens"], 0)
 
 
 if __name__ == "__main__":
