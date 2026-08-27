@@ -53,8 +53,9 @@ def load_profile(path: Path) -> Dict[str, Any]:
     probe = profile.get("probe")
     if not all(isinstance(item, dict) for item in (server, memory, probe)):
         raise ContextError("context profile needs server, memory, and probe objects")
-    if memory.get("context_tokens") != 262144:
-        raise ContextError("native profile must declare exactly 262144 context tokens")
+    context_tokens = memory.get("context_tokens")
+    if not isinstance(context_tokens, int) or not 250000 <= context_tokens <= 262144:
+        raise ContextError("native profile must declare 250000 through 262144 context tokens")
     runtime_patch = profile.get("runtime_patch")
     if not isinstance(runtime_patch, str) or not runtime_patch.startswith("patches/"):
         raise ContextError("context profile needs a repository-relative runtime_patch")
@@ -467,9 +468,12 @@ def allocate_action(args: argparse.Namespace, profile: Dict[str, Any]) -> int:
             forbidden = [item for item in log_failures if item.startswith("forbidden")]
             if forbidden:
                 raise ContextError("backend startup failed: " + "; ".join(forbidden))
+            if "model loaded" in log_text and log_failures:
+                raise ContextError("backend startup proof failed after model load: " + "; ".join(log_failures))
             declared = props.get("default_generation_settings", {}).get("n_ctx")
-            if declared != int(profile["memory"]["context_tokens"]):
-                raise ContextError(f"/props reports n_ctx={declared}, expected 262144")
+            expected_cells = int(profile["memory"]["allocated_cells"])
+            if declared != expected_cells:
+                raise ContextError(f"/props reports n_ctx={declared}, expected {expected_cells}")
             if health.get("status") != "ok":
                 raise ContextError(f"/health is not ok: {health}")
             if log_failures:
@@ -570,12 +574,14 @@ def probe_action(args: argparse.Namespace, profile: Dict[str, Any]) -> int:
     if failures:
         raise ContextError("server startup proof failed: " + "; ".join(failures))
     props = http_json(base_url(state) + "/props")
-    if props.get("default_generation_settings", {}).get("n_ctx") != 262144:
-        raise ContextError("server no longer reports the native 262144 context")
+    expected_cells = int(profile["memory"]["allocated_cells"])
+    context_tokens = int(profile["memory"]["context_tokens"])
+    if props.get("default_generation_settings", {}).get("n_ctx") != expected_cells:
+        raise ContextError(f"server no longer reports the configured {expected_cells}-cell context")
 
     lengths = args.lengths or [int(item) for item in profile["probe"]["lengths"]]
-    if lengths != sorted(set(lengths)) or not lengths or lengths[-1] >= 262144:
-        raise ContextError("probe lengths must be unique, increasing, and below 262144")
+    if lengths != sorted(set(lengths)) or not lengths or lengths[-1] >= context_tokens:
+        raise ContextError(f"probe lengths must be unique, increasing, and below {context_tokens}")
     output_path = args.output.expanduser().resolve()
     result: Dict[str, Any] = {
         "schema_version": RESULT_VERSION,
@@ -584,7 +590,8 @@ def probe_action(args: argparse.Namespace, profile: Dict[str, Any]) -> int:
         "profile_path": state["profile_path"],
         "state_path": str(state_path),
         "server_pid": state["pid"],
-        "configured_context_tokens": 262144,
+        "configured_context_tokens": context_tokens,
+        "allocated_context_cells": expected_cells,
         "stages": [],
     }
     baseline = collect_snapshot()
@@ -643,7 +650,8 @@ def health_action(args: argparse.Namespace, profile: Dict[str, Any]) -> int:
     props = http_json(base_url(state) + "/props")
     log_text = Path(state["log_path"]).read_text(encoding="utf-8", errors="replace")
     failures = check_log(profile, log_text)
-    if health.get("status") != "ok" or props.get("default_generation_settings", {}).get("n_ctx") != 262144:
+    expected_cells = int(profile["memory"]["allocated_cells"])
+    if health.get("status") != "ok" or props.get("default_generation_settings", {}).get("n_ctx") != expected_cells:
         failures.append("health or configured context does not match the profile")
     print(json.dumps({"health": health, "n_ctx": props.get("default_generation_settings", {}).get("n_ctx"), "failures": failures}, indent=2))
     return 0 if not failures else 3

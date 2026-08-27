@@ -37,7 +37,7 @@ git -C "${SOURCE_DIR}" apply --check "${PATCH}"
 git -C "${SOURCE_DIR}" apply "${PATCH}"
 git -C "${SOURCE_DIR}" apply --reverse --check "${PATCH}"
 git -C "${SOURCE_DIR}" diff --check
-expected_changes=$'ggml/src/ggml-metal/ggml-metal-device.m\nsrc/llama-memory-hybrid-idx.cpp\nsrc/llama-memory-hybrid-idx.h\nsrc/llama-model.cpp'
+expected_changes=$'ggml/src/ggml-metal/ggml-metal-device.m\nsrc/llama-kv-cache.cpp\nsrc/llama-kv-cache.h\nsrc/llama-memory-hybrid-idx.cpp\nsrc/llama-memory-hybrid-idx.h\nsrc/llama-model.cpp'
 [[ "$(git -C "${SOURCE_DIR}" diff --name-only)" == "${expected_changes}" ]] || {
     echo "error: long-context patch changed unexpected files" >&2
     git -C "${SOURCE_DIR}" status --short >&2

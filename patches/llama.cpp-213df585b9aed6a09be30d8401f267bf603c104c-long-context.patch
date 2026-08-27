@@ -2,8 +2,7 @@ diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-
 index 19c5782..87b13bf 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.m
 +++ b/ggml/src/ggml-metal/ggml-metal-device.m
-@@ -1175,6 +1175,10 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
-             dev->props.use_residency_sets = true;
+@@ -1176,4 +1176,8 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
  #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
              dev->props.use_residency_sets = getenv("GGML_METAL_NO_RESIDENCY") == nil;
 +            if (!dev->props.use_residency_sets) {
@@ -11,14 +10,43 @@ index 19c5782..87b13bf 100644
 +                fflush(stderr);
 +            }
  #endif
- 
-             dev->props.use_shared_buffers = dev->props.has_unified_memory;
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index ec0f5a7..86f7691 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -78,5 +78,6 @@ llama_kv_cache::llama_kv_cache(
+     const layer_filter_cb & filter,
+     const  layer_reuse_cb & reuse,
+-    const  layer_share_cb & share) :
++    const  layer_share_cb & share,
++                     bool   key_only) :
+     model(model), hparams(hparams), v_trans(v_trans),
+     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+@@ -227,5 +228,5 @@ llama_kv_cache::llama_kv_cache(
+
+         const bool has_k = true;
+-        const bool has_v = !is_mla;
++        const bool has_v = !is_mla && !key_only;
+
+         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 6cb6dbd..be76592 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -113,5 +113,6 @@ public:
+         const layer_filter_cb & filter,
+         const  layer_reuse_cb & reuse,
+-        const  layer_share_cb & share);
++        const  layer_share_cb & share,
++                         bool   key_only = false);
+
+     ~llama_kv_cache() = default;
 diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
-index 35059ba..ab016c6 100644
+index 35059ba..bba8bd6 100644
 --- a/src/llama-memory-hybrid-idx.cpp
 +++ b/src/llama-memory-hybrid-idx.cpp
-@@ -20,6 +20,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
-                             /* attn */
+@@ -21,4 +21,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                  ggml_type   type_k,
                  ggml_type   type_v,
 +                            /* indexer */
@@ -26,26 +54,25 @@ index 35059ba..ab016c6 100644
 +                ggml_type   type_v_idx,
                       bool   v_trans,
                   uint32_t   kv_size,
-                  uint32_t   n_pad,
-@@ -51,9 +54,11 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
-         hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
- 
+@@ -52,9 +55,11 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+
          LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
-+        LLAMA_LOG_INFO("%s: Qwen4Exp indexer cache types: K = %s, V = %s\n",
-+                __func__, ggml_type_name(type_k_idx), ggml_type_name(type_v_idx));
- 
++        LLAMA_LOG_INFO("%s: Qwen4Exp indexer cache types: K = %s, V = none (key-only)\n",
++                __func__, ggml_type_name(type_k_idx));
+
          return new llama_kv_cache(
 -            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
 +            model, hparams_idx, type_k_idx, type_v_idx, v_trans, offload, unified,
              kv_size, n_seq_max, n_pad, n_swa, swa_type,
-             nullptr, filter_idx, nullptr, nullptr);
+-            nullptr, filter_idx, nullptr, nullptr);
++            nullptr, filter_idx, nullptr, nullptr, true);
      }()) {}
+
 diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
 index a17e184..55b861a 100644
 --- a/src/llama-memory-hybrid-idx.h
 +++ b/src/llama-memory-hybrid-idx.h
-@@ -22,6 +22,9 @@ public:
-                             /* attn */
+@@ -23,4 +23,7 @@ public:
                  ggml_type   type_k,
                  ggml_type   type_v,
 +                            /* indexer */
@@ -53,23 +80,19 @@ index a17e184..55b861a 100644
 +                ggml_type   type_v_idx,
                       bool   v_trans,
                   uint32_t   kv_size,
-                  uint32_t   n_pad,
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 index 8b24ed5..cc81483 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -29,6 +29,7 @@
- #include <cassert>
+@@ -30,4 +30,5 @@
  #include <cfloat>
  #include <cstdint>
 +#include <cstdlib>
  #include <cstring>
  #include <cmath>
- #include <functional>
-@@ -1665,7 +1666,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
-         }
+@@ -1666,5 +1667,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
      }
- 
+
 -    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
 +    const char * mmap_prefetch_env = std::getenv("LLAMA_MMAP_PREFETCH");
 +    const bool mmap_prefetch = mmap_prefetch_env == nullptr || std::strcmp(mmap_prefetch_env, "0") != 0;
@@ -78,10 +101,8 @@ index 8b24ed5..cc81483 100644
 +    }
 +    ml.init_mappings(mmap_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
      pimpl->mappings.reserve(ml.mappings.size());
- 
-     // create the backend buffers
-@@ -2487,11 +2493,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
-                             /* filter_attn       */ std::move(filter_attn),
+
+@@ -2488,9 +2494,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* filter_recr       */ std::move(filter_recr));
                      } else if (needs_mem_idx) {
 -                        // sparse attention over a per-token indexer cache, in its own memory type
@@ -95,4 +116,3 @@ index 8b24ed5..cc81483 100644
 +                            /* indexer_type_v    */ GGML_TYPE_F16,
                              /* attn_v_trans      */ !cparams.flash_attn,
                              /* attn_kv_size      */ cparams.n_ctx_seq,
-                             /* attn_n_pad        */ 1,
