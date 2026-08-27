@@ -14,6 +14,11 @@ else
 fi
 SOURCE_DIR="${DEPS_ROOT}/llama.cpp-${REVISION}-expert-graph"
 BUILD_DIR="${DEPS_ROOT}/build-${REVISION}-expert-graph"
+BUILD_RUNTIME="${ORIGAMI_BUILD_RUNTIME:-0}"
+[[ "${BUILD_RUNTIME}" == "0" || "${BUILD_RUNTIME}" == "1" ]] || {
+    echo "error: ORIGAMI_BUILD_RUNTIME must be 0 or 1" >&2
+    exit 1
+}
 
 for command in git cmake ctest shasum; do
     command -v "${command}" >/dev/null || { echo "error: ${command} is required" >&2; exit 1; }
@@ -65,13 +70,17 @@ cmake -S "${SOURCE_DIR}" -B "${BUILD_DIR}" \
     -DLLAMA_CURL=OFF \
     -DLLAMA_BUILD_APP=OFF \
     -DLLAMA_BUILD_EXAMPLES=OFF \
-    -DLLAMA_BUILD_SERVER=OFF \
+    -DLLAMA_BUILD_SERVER="${BUILD_RUNTIME}" \
     -DLLAMA_BUILD_TESTS=ON \
-    -DLLAMA_BUILD_TOOLS=OFF \
+    -DLLAMA_BUILD_TOOLS="${BUILD_RUNTIME}" \
     -DLLAMA_BUILD_UI=OFF \
     -DLLAMA_USE_PREBUILT_UI=OFF
 jobs="${ORIGAMI_BUILD_JOBS:-$(sysctl -n hw.logicalcpu 2>/dev/null || getconf _NPROCESSORS_ONLN)}"
-cmake --build "${BUILD_DIR}" --config Release -j "${jobs}" --target test-expert-stream
+targets=(test-expert-stream)
+if [[ "${BUILD_RUNTIME}" == "1" ]]; then
+    targets+=(llama-cli llama-server)
+fi
+cmake --build "${BUILD_DIR}" --config Release -j "${jobs}" --target "${targets[@]}"
 ctest --test-dir "${BUILD_DIR}" -R '^test-expert-stream$' --output-on-failure
 
 printf '%s\n' "${REVISION}" > "${BUILD_DIR}/origami-revision.txt"

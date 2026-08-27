@@ -17,7 +17,7 @@ class ExpertStreamingPatchTests(unittest.TestCase):
         data = PATCH.read_bytes()
         self.assertEqual(
             hashlib.sha256(data).hexdigest(),
-            "4f6814129139c2070bcf564bf4f109311802af122be61325c9765b219035f5fd",
+            "3b579230d44b0f0cb34fad546bce3e8e29d321d943980744168e9286afcd05c2",
         )
         changed = {
             line.removeprefix("+++ b/")
@@ -75,7 +75,9 @@ class ExpertStreamingPatchTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         text = BOOTSTRAP.read_text()
-        self.assertIn("--target test-expert-stream", text)
+        self.assertIn("targets=(test-expert-stream)", text)
+        self.assertIn("targets+=(llama-cli llama-server)", text)
+        self.assertIn("ORIGAMI_BUILD_RUNTIME", text)
         self.assertIn("mktemp -d /private/tmp/origami-expert-graph-bootstrap", text)
         self.assertIn("expert-streaming-capabilities.json", text)
         self.assertNotIn("llama-cli --model", text)

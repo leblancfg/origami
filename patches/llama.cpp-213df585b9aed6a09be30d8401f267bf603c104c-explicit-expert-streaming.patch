@@ -46,7 +46,7 @@ index 97fe39b..0d971e2 100644
 +            ggml_backend_t metal = nullptr;
 +            for (ggml_backend_t candidate : backend_ptrs) {
 +                const char * name = ggml_backend_name(candidate);
-+                if (name != nullptr && std::strstr(name, "Metal") != nullptr) {
++                if (name != nullptr && std::strncmp(name, "MTL", 3) == 0) {
 +                    metal = candidate;
 +                    break;
 +                }

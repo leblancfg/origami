@@ -24,7 +24,7 @@ class ContextProfileTests(unittest.TestCase):
         )
         rendered = "\0".join(command)
         for option, value in (
-            ("--ctx-size", "250000"),
+            ("--ctx-size", "262144"),
             ("--gpu-layers", "43"),
             ("--ubatch-size", "8"),
             ("--cache-type-k", "q8_0"),
@@ -65,20 +65,20 @@ class ContextProfileTests(unittest.TestCase):
 
         attention = ctx * layers * (q8_row(512) + q8_row(512))
         indexer = ctx * layers * (2 * 128)
-        self.assertEqual(attention, 3265462272)
-        self.assertEqual(indexer, 768344064)
+        self.assertEqual(attention, 3422552064)
+        self.assertEqual(indexer, 805306368)
         self.assertEqual(memory["total_kv_bytes"], attention + indexer)
-        self.assertEqual(memory["persistent_payload_bytes"], 4188758016)
-        self.assertEqual(memory["unshared_qsa_graph_input_floor_bytes_at_ubatch_8"], 132059136)
-        self.assertEqual(memory["shared_qsa_graph_input_bound_bytes_at_ubatch_8"], 11004928)
-        self.assertEqual(memory["qsa_graph_input_reduction_bytes"], 121054208)
-        self.assertEqual(memory["context_and_graph_input_lower_bound_bytes"], 4199762944)
+        self.assertEqual(memory["persistent_payload_bytes"], 4383965184)
+        self.assertEqual(memory["unshared_qsa_graph_input_floor_bytes_at_ubatch_8"], 138412032)
+        self.assertEqual(memory["shared_qsa_graph_input_bound_bytes_at_ubatch_8"], 11534336)
+        self.assertEqual(memory["qsa_graph_input_reduction_bytes"], 126877696)
+        self.assertEqual(memory["context_and_graph_input_lower_bound_bytes"], 4395499520)
         self.assertEqual(memory["pinned_default_32_checkpoint_copy_bytes"], 4190109696)
 
     def test_log_proof_requires_capacity_qsa_flash_and_safeguards(self):
         text = "\n".join(self.profile["server"]["required_log_markers"])
         self.assertEqual(CONTEXT.check_log(self.profile, text), [])
-        missing = text.replace("n_ctx_seq             = 250112", "n_ctx_seq             = 16384")
+        missing = text.replace("n_ctx_seq             = 262144", "n_ctx_seq             = 16384")
         self.assertTrue(any("n_ctx_seq" in item for item in CONTEXT.check_log(self.profile, missing)))
         failed = text + "\nError: Compute error."
         self.assertTrue(any("forbidden" in item for item in CONTEXT.check_log(self.profile, failed)))
