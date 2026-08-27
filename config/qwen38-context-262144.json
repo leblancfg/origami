@@ -1,8 +1,9 @@
 {
   "schema_version": "origami.context-profile.v1",
-  "name": "qwen38-native-262144-q8-main-f16-index-research",
-  "status": "blocked-pending-backend-capabilities",
-  "runtime_revision": "bea3b12daee45876b0129a3602dc8f534ce30bf0",
+  "name": "qwen38-native-262144-q8-main-f16-index-candidate",
+  "status": "candidate-ready-for-allocation",
+  "runtime_revision": "213df585b9aed6a09be30d8401f267bf603c104c",
+  "runtime_patch": "patches/llama.cpp-213df585b9aed6a09be30d8401f267bf603c104c-long-context.patch",
   "model_manifest": "config/qwen38-flash-next-ud-iq1_s.json",
   "execution_gate": {
     "capability_manifest": "origami-context-capabilities.json",

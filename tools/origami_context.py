@@ -55,6 +55,9 @@ def load_profile(path: Path) -> Dict[str, Any]:
         raise ContextError("context profile needs server, memory, and probe objects")
     if memory.get("context_tokens") != 262144:
         raise ContextError("native profile must declare exactly 262144 context tokens")
+    runtime_patch = profile.get("runtime_patch")
+    if not isinstance(runtime_patch, str) or not runtime_patch.startswith("patches/"):
+        raise ContextError("context profile needs a repository-relative runtime_patch")
     if memory.get("total_kv_bytes") != memory.get("attention_kv_bytes", 0) + memory.get("qsa_indexer_kv_bytes", 0):
         raise ContextError("context profile KV byte ledger does not add up")
     gate = profile.get("execution_gate")
@@ -144,7 +147,14 @@ def server_executable(profile: Dict[str, Any], deps_root: Path) -> Path:
     marker = build / "origami-revision.txt"
     if not marker.is_file() or marker.read_text(encoding="utf-8").strip() != revision:
         raise ContextError("pinned backend revision marker is missing or stale")
-    patch = ROOT / "patches" / "llama.cpp-bea3b12-mmap-prefetch-optout.patch"
+    patch_value = profile.get("runtime_patch")
+    if not isinstance(patch_value, str) or not patch_value:
+        raise ContextError("context profile needs a runtime_patch")
+    patch = (ROOT / patch_value).resolve()
+    try:
+        patch.relative_to(ROOT)
+    except ValueError:
+        raise ContextError("runtime patch must remain inside the repository")
     patch_marker = build / "origami-patch.sha256"
     patch_hash = hashlib.sha256(patch.read_bytes()).hexdigest()
     if not patch_marker.is_file() or patch_marker.read_text(encoding="utf-8").strip() != patch_hash:

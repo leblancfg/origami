@@ -196,7 +196,8 @@ class ContextProfileTests(unittest.TestCase):
         )
         self.assertEqual(status.returncode, 0, status.stderr)
         value = json.loads(status.stdout)
-        self.assertEqual(value["status"], "blocked-pending-backend-capabilities")
+        self.assertEqual(value["status"], "candidate-ready-for-allocation")
+        self.assertEqual(value["runtime_revision"], "213df585b9aed6a09be30d8401f267bf603c104c")
         self.assertEqual(value["validated_prompt_tokens"], 0)
 
 
