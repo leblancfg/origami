@@ -1,0 +1,970 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 8922dc12a..034d4fa82 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -17,6 +17,7 @@ add_library(llama
+             llama-chat.cpp
+             llama-context.cpp
+             llama-cparams.cpp
++            llama-expert-stream.cpp
+             llama-grammar.cpp
+             llama-graph.cpp
+             llama-hparams.cpp
+diff --git a/src/llama-expert-stream.cpp b/src/llama-expert-stream.cpp
+new file mode 100644
+index 000000000..6ec7de7af
+--- /dev/null
++++ b/src/llama-expert-stream.cpp
+@@ -0,0 +1,537 @@
++#include "llama-expert-stream.h"
++
++#include "llama-mmap.h"
++
++#if defined(GGML_USE_METAL)
++#include "ggml-metal.h"
++#endif
++
++#include <algorithm>
++#include <cerrno>
++#include <condition_variable>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <limits>
++#include <mutex>
++#include <stdexcept>
++#include <thread>
++#include <utility>
++
++#if !defined(_WIN32)
++#include <sys/types.h>
++#include <unistd.h>
++#endif
++
++namespace {
++
++bool feature_enabled(std::string & error) {
++    const char * value = std::getenv("LLAMA_EXPLICIT_EXPERT_STREAMING");
++    if (value == nullptr || std::strcmp(value, "0") == 0) {
++        error = "LLAMA_EXPLICIT_EXPERT_STREAMING is not exactly 1";
++        return false;
++    }
++    if (std::strcmp(value, "1") != 0) {
++        error = "invalid LLAMA_EXPLICIT_EXPERT_STREAMING value (expected 0 or 1)";
++        return false;
++    }
++    return true;
++}
++
++bool valid_gate_up_type(ggml_type type) {
++    return type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ2_XXS;
++}
++
++bool same_slice(const llama_expert_stream_slice & a, const llama_expert_stream_slice & b) {
++    return a.file_index == b.file_index && a.offset == b.offset &&
++           a.nbytes == b.nbytes && a.type == b.type;
++}
++
++bool add_overflows(uint64_t a, uint64_t b) {
++    return b > std::numeric_limits<uint64_t>::max() - a;
++}
++
++} // namespace
++
++struct llama_expert_stream_cache::impl {
++    struct slot {
++        bool valid = false;
++        uint32_t refs = 0;
++        uint64_t last_used = 0;
++        uint32_t layer = 0;
++        uint32_t expert = 0;
++        llama_expert_stream_slice gate;
++        llama_expert_stream_slice up;
++        llama_expert_stream_slice down;
++    };
++
++    struct pending {
++        std::vector<uint32_t> slots;
++        std::unique_ptr<llama_expert_stream_completion> completion;
++    };
++
++    llama_expert_stream_config config;
++    std::vector<std::unique_ptr<llama_file>> files;
++    ggml_backend_buffer_t buffer = nullptr;
++    uint8_t * base = nullptr;
++    size_t bytes = 0;
++
++    mutable std::mutex mutex;
++    std::condition_variable condition;
++    std::deque<pending> pending_releases;
++    std::vector<slot> slots;
++    std::thread completion_worker;
++    bool stopping = false;
++
++    uint64_t clock = 0;
++    llama_expert_stream_stats counters;
++
++#if defined(_WIN32)
++    std::mutex windows_io_mutex;
++#endif
++
++    impl(const llama_expert_stream_config & config, const std::vector<std::string> & paths) : config(config) {
++        if (config.cache_slots == 0 || config.slot_bytes == 0 || config.backend == nullptr) {
++            throw std::runtime_error("expert stream cache requires nonzero slots, slot bytes, and a backend");
++        }
++        if (config.cache_slots > UINT32_MAX) {
++            throw std::runtime_error("expert stream cache has more than UINT32_MAX slots");
++        }
++        if (config.cache_slots > std::numeric_limits<size_t>::max() / config.slot_bytes) {
++            throw std::runtime_error("expert stream cache byte capacity overflows size_t");
++        }
++        if (paths.empty()) {
++            throw std::runtime_error("expert stream cache requires at least one shard");
++        }
++
++        bytes = config.cache_slots * config.slot_bytes;
++        const ggml_backend_dev_t device = ggml_backend_get_device(config.backend);
++        if (device == nullptr) {
++            throw std::runtime_error("expert stream cache backend has no device");
++        }
++        buffer = ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(device), bytes);
++        if (buffer == nullptr) {
++            throw std::runtime_error("failed to allocate bounded expert stream buffer");
++        }
++        base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(buffer));
++        if (base == nullptr) {
++            ggml_backend_buffer_free(buffer);
++            buffer = nullptr;
++            throw std::runtime_error("expert stream buffer is not host writable");
++        }
++
++        try {
++            files.reserve(paths.size());
++            for (const std::string & path : paths) {
++                files.emplace_back(new llama_file(path.c_str(), "rb"));
++            }
++            slots.resize(config.cache_slots);
++            completion_worker = std::thread([this] { completion_loop(); });
++        } catch (...) {
++            ggml_backend_buffer_free(buffer);
++            buffer = nullptr;
++            throw;
++        }
++    }
++
++    ~impl() {
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            stopping = true;
++        }
++        condition.notify_one();
++        if (completion_worker.joinable()) {
++            completion_worker.join();
++        }
++        ggml_backend_buffer_free(buffer);
++    }
++
++    void completion_loop() {
++        for (;;) {
++            pending item;
++            {
++                std::unique_lock<std::mutex> lock(mutex);
++                condition.wait(lock, [this] { return stopping || !pending_releases.empty(); });
++                if (pending_releases.empty()) {
++                    if (stopping) {
++                        return;
++                    }
++                    continue;
++                }
++                item = std::move(pending_releases.front());
++                pending_releases.pop_front();
++            }
++
++            // Reusing a slot after an uncertain completion would let Metal read
++            // overwritten quantized bytes. A completion implementation must not
++            // recover from a failed wait.
++            item.completion->wait();
++
++            {
++                std::lock_guard<std::mutex> lock(mutex);
++                release_locked(item.slots);
++            }
++        }
++    }
++
++    void release_locked(const std::vector<uint32_t> & owned_slots) {
++        for (uint32_t index : owned_slots) {
++            if (index >= slots.size() || slots[index].refs == 0) {
++                std::terminate();
++            }
++            slots[index].refs--;
++        }
++    }
++
++    bool request_valid(const llama_expert_stream_request & request, std::string & error) const {
++        if (!valid_gate_up_type(request.gate.type) || !valid_gate_up_type(request.up.type) ||
++            request.down.type != GGML_TYPE_IQ4_NL) {
++            error = "unsupported expert quant types (need IQ1_S/IQ2_XXS gate/up and IQ4_NL down)";
++            return false;
++        }
++
++        const llama_expert_stream_slice slices[] = { request.gate, request.up, request.down };
++        uint64_t total = 0;
++        for (const auto & slice : slices) {
++            if (slice.file_index >= files.size() || slice.nbytes == 0) {
++                error = "invalid expert shard index or empty slice";
++                return false;
++            }
++            if (slice.offset > files[slice.file_index]->size() ||
++                slice.nbytes > files[slice.file_index]->size() - slice.offset) {
++                error = "expert slice is outside its shard";
++                return false;
++            }
++            if (add_overflows(total, slice.nbytes)) {
++                error = "expert slice byte sum overflows";
++                return false;
++            }
++            total += slice.nbytes;
++        }
++        if (total > config.slot_bytes || total > std::numeric_limits<size_t>::max()) {
++            error = "expert slices exceed the fixed slot size";
++            return false;
++        }
++        return true;
++    }
++
++    bool matches(const slot & candidate, const llama_expert_stream_request & request) const {
++        return candidate.valid && candidate.layer == request.layer && candidate.expert == request.expert &&
++               same_slice(candidate.gate, request.gate) && same_slice(candidate.up, request.up) &&
++               same_slice(candidate.down, request.down);
++    }
++
++    bool read_exact(const llama_expert_stream_slice & slice, uint8_t * dst, std::string & error) {
++#if defined(_WIN32)
++        // Windows has no pread(). Serialize seek/read while retaining positional,
++        // bounded behavior. The Apple path below never changes the file cursor.
++        try {
++            std::lock_guard<std::mutex> io_lock(windows_io_mutex);
++            files[slice.file_index]->seek(static_cast<size_t>(slice.offset), SEEK_SET);
++            files[slice.file_index]->read_raw(dst, static_cast<size_t>(slice.nbytes));
++            return true;
++        } catch (const std::exception & exc) {
++            error = exc.what();
++            return false;
++        }
++#else
++        if (slice.offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
++            error = "expert slice offset exceeds off_t";
++            return false;
++        }
++
++        uint64_t done = 0;
++        const int fd = files[slice.file_index]->file_id();
++        while (done < slice.nbytes) {
++            const uint64_t remaining = slice.nbytes - done;
++            const size_t count = static_cast<size_t>(std::min<uint64_t>(
++                    remaining, static_cast<uint64_t>(std::numeric_limits<ssize_t>::max())));
++            ssize_t result;
++            do {
++                result = pread(fd, dst + static_cast<size_t>(done), count,
++                               static_cast<off_t>(slice.offset + done));
++            } while (result < 0 && errno == EINTR);
++            if (result <= 0) {
++                error = result == 0 ? "short expert pread" : std::string("expert pread failed: ") + std::strerror(errno);
++                return false;
++            }
++            done += static_cast<uint64_t>(result);
++        }
++        return true;
++#endif
++    }
++
++    bool load(uint32_t index, const llama_expert_stream_request & request, std::string & error) {
++        uint8_t * dst = base + static_cast<size_t>(index) * config.slot_bytes;
++        size_t offset = 0;
++        const llama_expert_stream_slice slices[] = { request.gate, request.up, request.down };
++        for (const auto & slice : slices) {
++            if (!read_exact(slice, dst + offset, error)) {
++                slots[index].valid = false;
++                return false;
++            }
++            offset += static_cast<size_t>(slice.nbytes);
++            counters.read_bytes += slice.nbytes;
++        }
++
++        slot & loaded = slots[index];
++        loaded.valid = true;
++        loaded.layer = request.layer;
++        loaded.expert = request.expert;
++        loaded.gate = request.gate;
++        loaded.up = request.up;
++        loaded.down = request.down;
++        loaded.last_used = ++clock;
++        return true;
++    }
++
++    llama_expert_stream_view make_view(uint32_t index) const {
++        const slot & current = slots[index];
++        const size_t slot_offset = static_cast<size_t>(index) * config.slot_bytes;
++        const size_t up_offset = slot_offset + static_cast<size_t>(current.gate.nbytes);
++        const size_t down_offset = up_offset + static_cast<size_t>(current.up.nbytes);
++
++        llama_expert_stream_view view;
++        view.layer = current.layer;
++        view.expert = current.expert;
++        view.slot = index;
++        view.buffer = buffer;
++        view.gate = { base + slot_offset, slot_offset, static_cast<size_t>(current.gate.nbytes), current.gate.type };
++        view.up = { base + up_offset, up_offset, static_cast<size_t>(current.up.nbytes), current.up.type };
++        view.down = { base + down_offset, down_offset, static_cast<size_t>(current.down.nbytes), current.down.type };
++        return view;
++    }
++};
++
++llama_expert_stream_lease::llama_expert_stream_lease() = default;
++
++llama_expert_stream_lease::~llama_expert_stream_lease() {
++    if (owner != nullptr) {
++        owner->release(std::move(slots));
++    }
++}
++
++llama_expert_stream_lease::llama_expert_stream_lease(llama_expert_stream_lease && other) noexcept {
++    *this = std::move(other);
++}
++
++llama_expert_stream_lease & llama_expert_stream_lease::operator=(llama_expert_stream_lease && other) noexcept {
++    if (this != &other) {
++        if (owner != nullptr) {
++            owner->release(std::move(slots));
++        }
++        owner = other.owner;
++        slots = std::move(other.slots);
++        result_views = std::move(other.result_views);
++        other.owner = nullptr;
++        other.slots.clear();
++        other.result_views.clear();
++    }
++    return *this;
++}
++
++const std::vector<llama_expert_stream_view> & llama_expert_stream_lease::views() const {
++    return result_views;
++}
++
++bool llama_expert_stream_lease::empty() const {
++    return result_views.empty();
++}
++
++llama_expert_stream_cache::llama_expert_stream_cache(std::unique_ptr<impl> pimpl) : pimpl(std::move(pimpl)) {}
++
++std::unique_ptr<llama_expert_stream_cache> llama_expert_stream_cache::create(
++        const llama_expert_stream_config & config,
++        const std::vector<std::string> & files,
++        std::string & error) {
++    error.clear();
++    if (!feature_enabled(error)) {
++        return nullptr;
++    }
++    try {
++        return std::unique_ptr<llama_expert_stream_cache>(
++                new llama_expert_stream_cache(std::make_unique<impl>(config, files)));
++    } catch (const std::exception & exc) {
++        error = exc.what();
++        return nullptr;
++    }
++}
++
++llama_expert_stream_cache::~llama_expert_stream_cache() = default;
++
++bool llama_expert_stream_cache::acquire(
++        const std::vector<llama_expert_stream_request> & requests,
++        uint32_t n_tokens,
++        llama_expert_stream_lease & lease,
++        std::string & error) {
++    error.clear();
++    if (n_tokens != 1) {
++        error = "explicit expert streaming only supports single-token decode";
++        return false;
++    }
++    if (requests.empty() || requests.size() > pimpl->config.cache_slots) {
++        error = "selected expert count is empty or exceeds cache slots";
++        return false;
++    }
++    if (!lease.empty() || lease.owner != nullptr) {
++        error = "output expert lease is already active";
++        return false;
++    }
++    for (const auto & request : requests) {
++        if (!pimpl->request_valid(request, error)) {
++            return false;
++        }
++    }
++
++    std::lock_guard<std::mutex> lock(pimpl->mutex);
++    std::vector<uint32_t> acquired;
++    std::vector<llama_expert_stream_view> views;
++    acquired.reserve(requests.size());
++    views.reserve(requests.size());
++
++    for (const auto & request : requests) {
++        uint32_t index = UINT32_MAX;
++        for (uint32_t i = 0; i < pimpl->slots.size(); ++i) {
++            if (pimpl->matches(pimpl->slots[i], request)) {
++                index = i;
++                pimpl->counters.hits++;
++                break;
++            }
++        }
++
++        if (index == UINT32_MAX) {
++            uint64_t oldest = std::numeric_limits<uint64_t>::max();
++            for (uint32_t i = 0; i < pimpl->slots.size(); ++i) {
++                const auto & candidate = pimpl->slots[i];
++                if (candidate.refs != 0) {
++                    continue;
++                }
++                if (!candidate.valid) {
++                    index = i;
++                    break;
++                }
++                if (candidate.last_used < oldest) {
++                    oldest = candidate.last_used;
++                    index = i;
++                }
++            }
++            if (index == UINT32_MAX) {
++                pimpl->release_locked(acquired);
++                error = "all expert cache slots are owned by unfinished device work";
++                return false;
++            }
++            if (pimpl->slots[index].valid) {
++                pimpl->counters.evictions++;
++            }
++            if (!pimpl->load(index, request, error)) {
++                pimpl->release_locked(acquired);
++                return false;
++            }
++            pimpl->counters.misses++;
++        }
++
++        auto & selected = pimpl->slots[index];
++        selected.refs++;
++        selected.last_used = ++pimpl->clock;
++        acquired.push_back(index);
++        views.push_back(pimpl->make_view(index));
++    }
++
++    lease.owner = this;
++    lease.slots = std::move(acquired);
++    lease.result_views = std::move(views);
++    return true;
++}
++
++bool llama_expert_stream_cache::retire(
++        llama_expert_stream_lease && lease,
++        std::unique_ptr<llama_expert_stream_completion> completion,
++        std::string & error) {
++    error.clear();
++    if (lease.owner != this || lease.slots.empty()) {
++        error = "expert lease does not belong to this cache";
++        return false;
++    }
++    if (!completion) {
++        error = "expert lease retirement requires a completion fence";
++        return false;
++    }
++
++    impl::pending item;
++    item.slots = std::move(lease.slots);
++    item.completion = std::move(completion);
++    lease.owner = nullptr;
++    lease.result_views.clear();
++
++    {
++        std::lock_guard<std::mutex> lock(pimpl->mutex);
++        if (pimpl->stopping) {
++            error = "expert completion worker is stopping";
++            // Restore RAII ownership so destruction cannot expose the slots.
++            lease.owner = this;
++            lease.slots = std::move(item.slots);
++            return false;
++        }
++        pimpl->pending_releases.emplace_back(std::move(item));
++    }
++    pimpl->condition.notify_one();
++    return true;
++}
++
++void llama_expert_stream_cache::release(std::vector<uint32_t> && slots) {
++    std::lock_guard<std::mutex> lock(pimpl->mutex);
++    pimpl->release_locked(slots);
++}
++
++llama_expert_stream_stats llama_expert_stream_cache::stats() const {
++    std::lock_guard<std::mutex> lock(pimpl->mutex);
++    return pimpl->counters;
++}
++
++size_t llama_expert_stream_cache::capacity_bytes() const {
++    return pimpl->bytes;
++}
++
++#if defined(GGML_USE_METAL)
++namespace {
++
++class llama_expert_stream_metal_event final : public llama_expert_stream_completion {
++public:
++    explicit llama_expert_stream_metal_event(ggml_backend_event_t event) : event(event) {}
++    ~llama_expert_stream_metal_event() override {
++        ggml_backend_event_free(event);
++    }
++
++    void wait() override {
++        ggml_backend_event_synchronize(event);
++    }
++
++private:
++    ggml_backend_event_t event;
++};
++
++} // namespace
++#endif
++
++std::unique_ptr<llama_expert_stream_completion> llama_expert_stream_metal_completion(
++        ggml_backend_t backend,
++        std::string & error) {
++    error.clear();
++#if defined(GGML_USE_METAL)
++    if (backend == nullptr || !ggml_backend_is_metal(backend)) {
++        error = "expert streaming completion requires the Metal backend";
++        return nullptr;
++    }
++    ggml_backend_event_t event = ggml_backend_event_new(ggml_backend_get_device(backend));
++    if (event == nullptr) {
++        error = "Metal backend did not provide a completion event";
++        return nullptr;
++    }
++    ggml_backend_event_record(event, backend);
++    return std::make_unique<llama_expert_stream_metal_event>(event);
++#else
++    (void) backend;
++    error = "llama.cpp was built without Metal expert completion support";
++    return nullptr;
++#endif
++}
+diff --git a/src/llama-expert-stream.h b/src/llama-expert-stream.h
+new file mode 100644
+index 000000000..d316ca84f
+--- /dev/null
++++ b/src/llama-expert-stream.h
+@@ -0,0 +1,139 @@
++#pragma once
++
++#include "ggml-backend.h"
++#include "ggml.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++// Experimental Qwen4Exp single-token expert staging. This interface is private
++// to llama.cpp until the graph can stop after routing and resume with compact
++// expert tensors.
++struct llama_expert_stream_slice {
++    uint32_t  file_index = 0;
++    uint64_t  offset     = 0;
++    uint64_t  nbytes     = 0;
++    ggml_type type       = GGML_TYPE_COUNT;
++};
++
++struct llama_expert_stream_request {
++    uint32_t layer  = 0;
++    uint32_t expert = 0;
++
++    llama_expert_stream_slice gate;
++    llama_expert_stream_slice up;
++    llama_expert_stream_slice down;
++};
++
++struct llama_expert_stream_projection {
++    void * data = nullptr;
++    size_t buffer_offset = 0;
++    size_t nbytes = 0;
++    ggml_type type = GGML_TYPE_COUNT;
++};
++
++struct llama_expert_stream_view {
++    uint32_t layer  = 0;
++    uint32_t expert = 0;
++    uint32_t slot   = 0;
++
++    ggml_backend_buffer_t buffer = nullptr;
++    llama_expert_stream_projection gate;
++    llama_expert_stream_projection up;
++    llama_expert_stream_projection down;
++};
++
++struct llama_expert_stream_config {
++    size_t cache_slots = 0;
++    size_t slot_bytes  = 0;
++    ggml_backend_t backend = nullptr;
++};
++
++struct llama_expert_stream_stats {
++    uint64_t hits       = 0;
++    uint64_t misses     = 0;
++    uint64_t evictions  = 0;
++    uint64_t read_bytes = 0;
++};
++
++class llama_expert_stream_cache;
++
++class llama_expert_stream_lease {
++public:
++    llama_expert_stream_lease();
++    ~llama_expert_stream_lease();
++
++    llama_expert_stream_lease(llama_expert_stream_lease && other) noexcept;
++    llama_expert_stream_lease & operator=(llama_expert_stream_lease && other) noexcept;
++
++    llama_expert_stream_lease(const llama_expert_stream_lease &) = delete;
++    llama_expert_stream_lease & operator=(const llama_expert_stream_lease &) = delete;
++
++    const std::vector<llama_expert_stream_view> & views() const;
++    bool empty() const;
++
++private:
++    friend class llama_expert_stream_cache;
++
++    llama_expert_stream_cache * owner = nullptr;
++    std::vector<uint32_t> slots;
++    std::vector<llama_expert_stream_view> result_views;
++};
++
++// wait() must return only after every device command that can read a lease has
++// completed. The Metal implementation below uses a shared-event signal queued
++// after the graph command buffers.
++class llama_expert_stream_completion {
++public:
++    virtual ~llama_expert_stream_completion() = default;
++    virtual void wait() = 0;
++};
++
++class llama_expert_stream_cache {
++public:
++    static std::unique_ptr<llama_expert_stream_cache> create(
++            const llama_expert_stream_config & config,
++            const std::vector<std::string> & files,
++            std::string & error);
++
++    ~llama_expert_stream_cache();
++
++    llama_expert_stream_cache(const llama_expert_stream_cache &) = delete;
++    llama_expert_stream_cache & operator=(const llama_expert_stream_cache &) = delete;
++
++    // Requests and returned views retain router order. Only exact Qwen4Exp
++    // IQ1_S/IQ2_XXS gate/up plus IQ4_NL down slices are accepted.
++    bool acquire(
++            const std::vector<llama_expert_stream_request> & requests,
++            uint32_t n_tokens,
++            llama_expert_stream_lease & lease,
++            std::string & error);
++
++    // Transfers slot ownership to the completion worker. A slot is not an
++    // eviction candidate until completion->wait() has returned.
++    bool retire(
++            llama_expert_stream_lease && lease,
++            std::unique_ptr<llama_expert_stream_completion> completion,
++            std::string & error);
++
++    llama_expert_stream_stats stats() const;
++    size_t capacity_bytes() const;
++
++private:
++    friend class llama_expert_stream_lease;
++    struct impl;
++
++    explicit llama_expert_stream_cache(std::unique_ptr<impl> pimpl);
++    void release(std::vector<uint32_t> && slots);
++
++    std::unique_ptr<impl> pimpl;
++};
++
++// Records a Metal shared event after work already submitted on backend. Returns
++// null for every non-Metal backend or if events are unavailable.
++std::unique_ptr<llama_expert_stream_completion> llama_expert_stream_metal_completion(
++        ggml_backend_t backend,
++        std::string & error);
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index b9f9d4b78..97125245a 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -289,6 +289,7 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
+   llama_build_and_test(test-opt.cpp)
+ endif()
+ llama_build_and_test(test-backend-ops.cpp)
++llama_build_and_test(test-expert-stream.cpp)
+
+ llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
+ llama_build_and_test(test-autorelease.cpp       LABEL "model")
+diff --git a/tests/test-expert-stream.cpp b/tests/test-expert-stream.cpp
+new file mode 100644
+index 000000000..f5cee9968
+--- /dev/null
++++ b/tests/test-expert-stream.cpp
+@@ -0,0 +1,252 @@
++#include "../src/llama-expert-stream.h"
++
++#include "ggml-backend.h"
++
++#include <chrono>
++#include <cstdio>
++#include <condition_variable>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace {
++
++#define CHECK(condition) do { if (!(condition)) { std::fprintf(stderr, "CHECK failed: %s:%d: %s\n", __FILE__, __LINE__, #condition); std::abort(); } } while (0)
++
++void set_feature(const char * value) {
++#if defined(_WIN32)
++    _putenv_s("LLAMA_EXPLICIT_EXPERT_STREAMING", value ? value : "");
++#else
++    if (value) {
++        setenv("LLAMA_EXPLICIT_EXPERT_STREAMING", value, 1);
++    } else {
++        unsetenv("LLAMA_EXPLICIT_EXPERT_STREAMING");
++    }
++#endif
++}
++
++std::filesystem::path temp_path(const char * stem) {
++    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
++    return std::filesystem::temp_directory_path() /
++           (std::string("llama-") + stem + "-" + std::to_string(nonce) + ".bin");
++}
++
++std::vector<uint8_t> make_bytes(size_t size, uint8_t salt) {
++    std::vector<uint8_t> bytes(size);
++    for (size_t i = 0; i < size; ++i) {
++        bytes[i] = static_cast<uint8_t>((i * 37 + salt) & 0xff);
++    }
++    return bytes;
++}
++
++void write_bytes(const std::filesystem::path & path, const std::vector<uint8_t> & bytes) {
++    std::ofstream out(path, std::ios::binary);
++    CHECK(out.good());
++    out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
++    CHECK(out.good());
++}
++
++llama_expert_stream_request request_a() {
++    llama_expert_stream_request request;
++    request.layer = 7;
++    request.expert = 401;
++    request.gate = { 0, 37, 17, GGML_TYPE_IQ1_S };
++    request.up   = { 1, 101, 19, GGML_TYPE_IQ2_XXS };
++    request.down = { 0, 333, 23, GGML_TYPE_IQ4_NL };
++    return request;
++}
++
++llama_expert_stream_request request_b() {
++    llama_expert_stream_request request;
++    request.layer = 8;
++    request.expert = 9;
++    request.gate = { 1, 511, 16, GGML_TYPE_IQ2_XXS };
++    request.up   = { 0, 701, 18, GGML_TYPE_IQ1_S };
++    request.down = { 1, 911, 24, GGML_TYPE_IQ4_NL };
++    return request;
++}
++
++struct completion_state {
++    std::mutex mutex;
++    std::condition_variable condition;
++    bool done = false;
++};
++
++class blocking_completion final : public llama_expert_stream_completion {
++public:
++    explicit blocking_completion(std::shared_ptr<completion_state> state) : state(std::move(state)) {}
++
++    void wait() override {
++        std::unique_lock<std::mutex> lock(state->mutex);
++        state->condition.wait(lock, [this] { return state->done; });
++    }
++
++private:
++    std::shared_ptr<completion_state> state;
++};
++
++void signal(const std::shared_ptr<completion_state> & state) {
++    {
++        std::lock_guard<std::mutex> lock(state->mutex);
++        state->done = true;
++    }
++    state->condition.notify_one();
++}
++
++} // namespace
++
++int main() {
++    const auto path0 = temp_path("expert-0");
++    const auto path1 = temp_path("expert-1");
++    const auto bytes0 = make_bytes(2048, 11);
++    const auto bytes1 = make_bytes(2048, 73);
++    write_bytes(path0, bytes0);
++    write_bytes(path1, bytes1);
++
++    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
++    CHECK(backend != nullptr);
++
++    const std::vector<std::string> paths = { path0.string(), path1.string() };
++    const llama_expert_stream_config config = { 2, 64, backend };
++    std::string error;
++
++    CHECK(!llama_expert_stream_metal_completion(backend, error));
++    CHECK(error.find("Metal") != std::string::npos);
++
++    set_feature(nullptr);
++    CHECK(!llama_expert_stream_cache::create(config, paths, error));
++    CHECK(error.find("not exactly 1") != std::string::npos);
++
++    set_feature("yes");
++    CHECK(!llama_expert_stream_cache::create(config, paths, error));
++    CHECK(error.find("invalid") != std::string::npos);
++
++    set_feature("1");
++    auto cache = llama_expert_stream_cache::create(config, paths, error);
++    CHECK(cache != nullptr && error.empty());
++    CHECK(cache->capacity_bytes() == 128);
++
++    llama_expert_stream_lease invalid_decode;
++    CHECK(!cache->acquire({ request_a() }, 2, invalid_decode, error));
++    CHECK(error.find("single-token") != std::string::npos);
++
++    auto invalid_type = request_a();
++    invalid_type.gate.type = GGML_TYPE_Q4_0;
++    CHECK(!cache->acquire({ invalid_type }, 1, invalid_decode, error));
++    CHECK(error.find("unsupported expert quant") != std::string::npos);
++
++    {
++        llama_expert_stream_lease lease;
++        CHECK(cache->acquire({ request_a() }, 1, lease, error));
++        CHECK(lease.views().size() == 1);
++        const auto & view = lease.views()[0];
++        CHECK(view.layer == 7 && view.expert == 401);
++        CHECK(view.gate.type == GGML_TYPE_IQ1_S);
++        CHECK(view.up.type == GGML_TYPE_IQ2_XXS);
++        CHECK(view.down.type == GGML_TYPE_IQ4_NL);
++        CHECK(std::memcmp(view.gate.data, bytes0.data() + 37, 17) == 0);
++        CHECK(std::memcmp(view.up.data, bytes1.data() + 101, 19) == 0);
++        CHECK(std::memcmp(view.down.data, bytes0.data() + 333, 23) == 0);
++        CHECK(view.up.buffer_offset == view.gate.buffer_offset + 17);
++        CHECK(view.down.buffer_offset == view.up.buffer_offset + 19);
++    }
++
++    {
++        llama_expert_stream_lease hit;
++        CHECK(cache->acquire({ request_a() }, 1, hit, error));
++        const auto stats = cache->stats();
++        CHECK(stats.hits == 1);
++        CHECK(stats.misses == 1);
++        CHECK(stats.read_bytes == 17 + 19 + 23);
++    }
++
++    {
++        llama_expert_stream_lease router_order;
++        CHECK(cache->acquire({ request_b(), request_a() }, 1, router_order, error));
++        CHECK(router_order.views().size() == 2);
++        CHECK(router_order.views()[0].expert == request_b().expert);
++        CHECK(router_order.views()[1].expert == request_a().expert);
++    }
++
++    // A single-slot cache cannot overwrite A while a completion object still
++    // owns its lease. This is the same ownership transition used by the Metal
++    // shared-event completion implementation.
++    const llama_expert_stream_config one_slot_config = { 1, 64, backend };
++    auto one_slot = llama_expert_stream_cache::create(one_slot_config, paths, error);
++    CHECK(one_slot != nullptr);
++
++    llama_expert_stream_lease in_flight;
++    CHECK(one_slot->acquire({ request_a() }, 1, in_flight, error));
++    auto state = std::make_shared<completion_state>();
++    CHECK(one_slot->retire(std::move(in_flight), std::make_unique<blocking_completion>(state), error));
++
++    llama_expert_stream_lease blocked;
++    CHECK(!one_slot->acquire({ request_b() }, 1, blocked, error));
++    CHECK(error.find("unfinished device work") != std::string::npos);
++
++    signal(state);
++    for (;;) {
++        llama_expert_stream_lease after_completion;
++        if (one_slot->acquire({ request_b() }, 1, after_completion, error)) {
++            const auto & view = after_completion.views()[0];
++            CHECK(std::memcmp(view.gate.data, bytes1.data() + 511, 16) == 0);
++            CHECK(std::memcmp(view.up.data, bytes0.data() + 701, 18) == 0);
++            CHECK(std::memcmp(view.down.data, bytes1.data() + 911, 24) == 0);
++            break;
++        }
++        std::this_thread::yield();
++    }
++    const auto one_slot_stats = one_slot->stats();
++    CHECK(one_slot_stats.evictions == 1);
++
++    // Exercise the real Metal shared-event completion path without evaluating
++    // a graph or opening model weights.
++    ggml_backend_t metal = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
++    if (metal != nullptr) {
++        const llama_expert_stream_config metal_config = { 1, 64, metal };
++        auto metal_cache = llama_expert_stream_cache::create(metal_config, paths, error);
++        CHECK(metal_cache != nullptr);
++        llama_expert_stream_lease metal_in_flight;
++        CHECK(metal_cache->acquire({ request_a() }, 1, metal_in_flight, error));
++        auto completion = llama_expert_stream_metal_completion(metal, error);
++        CHECK(completion != nullptr && error.empty());
++        CHECK(metal_cache->retire(std::move(metal_in_flight), std::move(completion), error));
++
++        bool metal_released = false;
++        for (size_t attempt = 0; attempt < 100000 && !metal_released; ++attempt) {
++            llama_expert_stream_lease next;
++            metal_released = metal_cache->acquire({ request_b() }, 1, next, error);
++            if (!metal_released) {
++                std::this_thread::yield();
++            }
++        }
++        CHECK(metal_released);
++        metal_cache.reset();
++        ggml_backend_free(metal);
++    }
++
++    // Keep the open file's original bound, truncate the shard, and prove an
++    // exact positional read rejects EOF rather than retaining partial bytes.
++    auto short_cache = llama_expert_stream_cache::create(one_slot_config, paths, error);
++    CHECK(short_cache != nullptr);
++    std::filesystem::resize_file(path0, 340);
++    llama_expert_stream_lease short_read;
++    CHECK(!short_cache->acquire({ request_a() }, 1, short_read, error));
++    CHECK(error.find("short expert pread") != std::string::npos);
++
++    short_cache.reset();
++    one_slot.reset();
++    cache.reset();
++    ggml_backend_free(backend);
++    std::filesystem::remove(path0);
++    std::filesystem::remove(path1);
++    set_feature(nullptr);
++    return 0;
++}

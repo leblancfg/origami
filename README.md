@@ -57,6 +57,16 @@ python3 -m origami_artifacts.sidecar index /path/to/UD-IQ1_S \
 
 Packing is resumable and atomically publishes a fixed-format binary pack plus JSON index. Sample/full byte verification, an aligned `pread` API, and a benchmark command are included. See [docs/expert-sidecar.md](docs/expert-sidecar.md) for the exact format and recovery contract.
 
+## Explicit expert-read vertical slice
+
+The pinned `213df585` patch adds fixed-size expert slots, exact positional reads for mixed IQ1_S/IQ2_XXS/IQ4_NL slices, and Metal-event slot retirement. Its synthetic test loads no model. The feature remains fail-closed because Qwen4Exp still needs a routing/compute graph split before the first routed `MUL_MAT_ID`.
+
+```sh
+scripts/bootstrap-expert-streaming-llama-cpp.sh
+```
+
+See [docs/expert-streaming.md](docs/expert-streaming.md) for the implemented contract and remaining call boundary.
+
 ## Long-context research profile
 
 The GGUF declares a native 262,144-token window. The guarded candidate uses the 213df585 runtime plus the checked-in patch: Q8_0 main attention KV, an F16 key-only indexer cache, quantized-cache rotation support, and opt-in shared QSA graph inputs. It requests 250,000 tokens and has not completed an allocation or prompt probe.
