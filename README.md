@@ -43,3 +43,18 @@ python3 -m origami_artifacts /path/to/gguf/shards --json --output ledger.json
 ```
 
 `tools/gguf-map-audit.py` imports the same bounded parser and adds the pinned llama.cpp placement model. See [docs/artifact-inspector.md](docs/artifact-inspector.md), [docs/plan.md](docs/plan.md), and [docs/validation.md](docs/validation.md).
+
+## Native context profile
+
+The pinned GGUF declares a native 262,144-token window. The checked-in server profile uses the measured CPU output placement, both lazy-mmap safeguards, one slot, forced Flash Attention, and Q8_0 attention plus QSA indexer caches. It disables context shift, prompt-cache copies, and recurrent checkpoints.
+
+```sh
+# Non-invasive: print the exact command. This does not start a server.
+scripts/context-profile.sh command /path/to/UD-IQ1_S
+
+# Run only after stopping every existing llama-server.
+scripts/context-profile.sh allocate /path/to/UD-IQ1_S \
+  --state-dir /private/tmp/origami-context-262144
+```
+
+The allocation and prompt stages are separate. The probe monitors memory pressure, compressor occupancy, swap use, and swap-out pages; a gate failure terminates only the server owned by its state file. No native-context allocation has been run on the test host. See [docs/context-profile.md](docs/context-profile.md) for the exact flags, current 16K server evidence, Pi configuration, staged prompt plan, and the remaining 500K/1M backend gaps.

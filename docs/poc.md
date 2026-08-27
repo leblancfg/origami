@@ -25,8 +25,8 @@ The script creates `/private/tmp/origami-deps/llama.cpp-bea3b12daee45876b0129a36
 1. Fetch and detach at the full pinned revision.
 2. Verify `HEAD`, apply the mmap patch idempotently, and verify that `HEAD` is unchanged.
 3. Reject patched changes outside `src/llama-model.cpp` and `ggml/src/ggml-metal/ggml-metal-device.m`. The Metal change only emits the safeguard state before CLI logging is configured.
-4. Build `llama-cli`, `test-llama-archs`, and `test-backend-ops`.
-5. check every PoC CLI option against the built binary's `--help` output.
+4. Build `llama-cli`, `llama-server`, `test-llama-archs`, and `test-backend-ops`.
+5. Check the short PoC and native-context options against the corresponding binary's `--help` output.
 
 ## Preflight and launch
 

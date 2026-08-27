@@ -75,7 +75,7 @@ cmake -S "${SOURCE_DIR}" -B "${BUILD_DIR}" \
 
 jobs="${ORIGAMI_BUILD_JOBS:-$(sysctl -n hw.logicalcpu 2>/dev/null || getconf _NPROCESSORS_ONLN)}"
 cmake --build "${BUILD_DIR}" --config Release -j "${jobs}" \
-    --target llama-cli test-llama-archs test-backend-ops
+    --target llama-cli llama-server test-llama-archs test-backend-ops
 printf '%s\n' "${REVISION}" > "${BUILD_DIR}/origami-revision.txt"
 shasum -a 256 "${PATCH}" | awk '{print $1}' > "${BUILD_DIR}/origami-patch.sha256"
 
@@ -92,6 +92,30 @@ for flag in '--offline' '--model' '--prompt' '--ctx-size' '--batch-size' '--ubat
         exit 1
     }
 done
+SERVER="${BUILD_DIR}/bin/llama-server"
+"${SERVER}" --version
+server_help="$("${SERVER}" --help 2>&1)"
+for flag in '--offline' '--ctx-size' '--batch-size' '--ubatch-size' '--parallel' \
+            '--load-mode' '--gpu-layers' '--override-tensor' '--fit' \
+            '--cache-type-k' '--cache-type-v' '--flash-attn' '--kv-offload' \
+            '--no-kv-unified' '--no-context-shift' '--cache-ram' '--no-cache-prompt' \
+            '--cache-reuse' '--ctx-checkpoints' '--no-cache-idle-slots' '--no-warmup' \
+            '--metrics' '--slots' '--perf' '--log-verbosity' \
+            '--rope-scaling' '--rope-scale' '--yarn-orig-ctx' '--override-kv'; do
+    grep -Fq -- "${flag}" <<< "${server_help}" || {
+        echo "error: pinned llama-server help does not contain ${flag}" >&2
+        exit 1
+    }
+done
+"${SERVER}" \
+    --offline --host 127.0.0.1 --port 18080 --alias origami-flag-check \
+    --load-mode mmap --gpu-layers all --override-tensor '^output=CPU' --fit off \
+    --ctx-size 262144 --batch-size 32 --ubatch-size 32 --parallel 1 \
+    --no-kv-unified --kv-offload --cache-type-k q8_0 --cache-type-v q8_0 \
+    --flash-attn on --no-context-shift --cache-ram 0 --no-cache-prompt \
+    --cache-reuse 0 --ctx-checkpoints 0 --no-cache-idle-slots --no-warmup \
+    --metrics --slots --perf --log-verbosity 4 \
+    --model /tmp/origami-flag-check-does-not-exist.gguf --version >/dev/null 2>&1
 "${CLI}" \
     --offline --load-mode mmap --gpu-layers all \
     --ctx-size 512 --batch-size 32 --ubatch-size 32 \

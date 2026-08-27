@@ -1,0 +1,50 @@
+{
+  "schema_version": "origami.context-extension-research.v1",
+  "status": "research-only-not-launchable",
+  "base_profile": "config/qwen38-context-262144.json",
+  "native_context_tokens": 262144,
+  "targets": [
+    {
+      "name": "qwen38-yarn-524288",
+      "context_tokens": 524288,
+      "yarn_factor": 2.0,
+      "argument_delta": [
+        "--ctx-size", "524288",
+        "--override-kv", "qwen4exp.context_length=int:524288",
+        "--rope-scaling", "yarn",
+        "--rope-scale", "2",
+        "--yarn-orig-ctx", "262144"
+      ],
+      "q8_0_total_kv_bytes": 9412018176,
+      "q4_0_total_kv_bytes": 4982833152,
+      "pi_context_window": null,
+      "validated_prompt_tokens": 0
+    },
+    {
+      "name": "qwen38-yarn-1000000",
+      "context_tokens": 1000000,
+      "internal_context_tokens_after_256_cell_padding": 1000192,
+      "yarn_factor": 4.0,
+      "argument_delta": [
+        "--ctx-size", "1000000",
+        "--override-kv", "qwen4exp.context_length=int:1000000",
+        "--rope-scaling", "yarn",
+        "--rope-scale", "4",
+        "--yarn-orig-ctx", "262144"
+      ],
+      "q8_0_total_kv_bytes_at_requested_cells": 17952000000,
+      "q4_0_total_kv_bytes_at_requested_cells": 9504000000,
+      "q8_0_total_kv_bytes_at_padded_cells": 17955446784,
+      "q4_0_total_kv_bytes_at_padded_cells": 9505824768,
+      "pi_context_window": null,
+      "validated_prompt_tokens": 0
+    }
+  ],
+  "blocking_requirements": [
+    "dedicated allocation proof",
+    "prompt stages crossing 262144 tokens",
+    "long-context quality comparison against a trusted implementation",
+    "bounded or measured routed-weight residency",
+    "QSA host setup and compute-buffer accounting"
+  ]
+}

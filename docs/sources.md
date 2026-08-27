@@ -6,6 +6,7 @@
 - [Qwen technical report](https://github.com/QwenLM/Qwen3.8-Flash-Next/blob/main/tech_report.pdf)
 - [Unsloth dynamic GGUFs](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF), pinned for the proof of concept at revision [`d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249/UD-IQ1_S)
 - [Official FP8 checkpoint](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8)
+- [Official Qwen3.8-Flash-Next model card and long-context YaRN recipe](https://huggingface.co/Qwen/Qwen3.8-Flash-Next#processing-ultra-long-texts)
 
 ## Reference implementations
 
