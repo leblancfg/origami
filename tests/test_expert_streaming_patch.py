@@ -17,7 +17,7 @@ class ExpertStreamingPatchTests(unittest.TestCase):
         data = PATCH.read_bytes()
         self.assertEqual(
             hashlib.sha256(data).hexdigest(),
-            "3b579230d44b0f0cb34fad546bce3e8e29d321d943980744168e9286afcd05c2",
+            "d6a49170fdadd147896c4ab1e40402aaa3f7b5afaa647887a0a0075df4079848",
         )
         changed = {
             line.removeprefix("+++ b/")
@@ -47,6 +47,7 @@ class ExpertStreamingPatchTests(unittest.TestCase):
         text = PATCH.read_text()
         for marker in (
             "LLAMA_EXPLICIT_EXPERT_STREAMING",
+            "std::strncmp(name, \"MTL\", 3)",
             "n_tokens != 1",
             "GGML_TYPE_IQ1_S",
             "GGML_TYPE_IQ2_XXS",
@@ -59,10 +60,12 @@ class ExpertStreamingPatchTests(unittest.TestCase):
             "std::memcmp(view.down.data",
             "routed tensors will not be mapped or loaded",
             "TENSOR_SKIP",
-            "expert_stream_layer->boundary = weights",
+            "expert_stream_layer->boundary = selected_experts",
+            "expert_stream_layer->routed_selected",
+            "ggml_backend_sched_set_tensor_backend",
             "selected expert IDs were assigned away",
             "GGML_STATUS_ABORTED",
-            "test_scheduler_id_remap_boundary",
+            "test_scheduler_separate_routed_ids",
         ):
             self.assertIn(marker, text)
 
@@ -83,9 +86,9 @@ class ExpertStreamingPatchTests(unittest.TestCase):
         self.assertNotIn("llama-cli --model", text)
         self.assertNotIn("llama-server --model", text)
 
-    def test_capability_record_is_strict_and_does_not_claim_a_model_run(self):
+    def test_capability_record_reports_strict_real_model_parity(self):
         value = json.loads(CAPABILITIES.read_text())
-        self.assertEqual(value["schema_version"], "origami.expert-streaming-capabilities.v2")
+        self.assertEqual(value["schema_version"], "origami.expert-streaming-capabilities.v3")
         self.assertEqual(value["strict_feature_flag"], "LLAMA_EXPLICIT_EXPERT_STREAMING=1")
         caps = value["capabilities"]
         self.assertTrue(caps["fixed_cache_buffer_assigned_before_scheduler_split"])
@@ -93,7 +96,10 @@ class ExpertStreamingPatchTests(unittest.TestCase):
         self.assertFalse(caps["dynamic_tensor_buffer_substitution"])
         self.assertFalse(caps["mmap_routed_fallback"])
         self.assertFalse(caps["prefill"])
-        self.assertFalse(value["validation"]["real_model_launch"])
+        self.assertTrue(caps["original_ids_never_mutated"])
+        self.assertTrue(caps["dedicated_remapped_id_inputs"])
+        self.assertTrue(value["validation"]["real_model_launch"])
+        self.assertTrue(value["validation"]["callback_tensor_byte_parity"])
 
 
 if __name__ == "__main__":

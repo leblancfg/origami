@@ -20,10 +20,10 @@ The Qwen4Exp graph replaces each omitted routed tensor with a strided view over 
 
 The scheduler callback creates two synchronized boundaries per layer:
 
-1. `build_moe_ffn()` expands the final normalized and scaled `ffn_moe_weights`. The callback then reads the original selected IDs. Weight lookup has already consumed those IDs, preserving router order and values.
-2. The cache acquires the corresponding gate/up/down records. The callback rewrites only the allocated I32 selected-ID payload from original expert numbers to physical cache-slot numbers.
-3. Routed gate, up, and down `MUL_MAT_ID` nodes execute against the fixed cache views.
-4. After synchronized `ffn_moe_out`, the callback restores the original selected IDs and retires the lease behind a Metal event recorded after the submitted work.
+1. When `ffn_moe_topk` completes, the callback reads the original selected IDs. It never changes that tensor. The normalized weight lookup continues to use the router output.
+2. The cache acquires the corresponding gate/up/down records. The callback writes physical cache-slot numbers to a dedicated I32 graph input assigned to Metal before scheduler allocation.
+3. Routed gate, up, and down `MUL_MAT_ID` nodes use the dedicated IDs and fixed cache views. The graph expands the weight lookup first, which keeps the callback and routed work in the required order.
+4. After synchronized `ffn_moe_out`, the callback retires the lease behind a Metal event.
 
 `LLAMA_EXPERT_CACHE_SLOTS` sets the fixed slot count. It must be an unsigned integer at least as large as `expert_used_count`; the default is twice that count. Slot size is derived from the largest real GGUF gate/up/down record and padded to 4 KiB. Capacity is exactly `slots * slot_bytes`.
 
@@ -33,13 +33,21 @@ The scheduler callback now returns `GGML_STATUS_ABORTED` when a callback rejects
 
 Changing a tensor's buffer after scheduler allocation is not safe at this revision. Backend assignment and cross-backend copies are decided in `ggml_backend_sched_split_graph()`. The scheduler may replace a node source with a copy tensor, and its MoE copy optimization runs before eval callbacks. Swapping the original tensor's buffer at the callback would therefore be invisible to some scheduled nodes or would disagree with their precomputed backend.
 
-The integrated path does not substitute buffers. Cache tensors are pre-allocated in the fixed Metal buffer before graph splitting. At the routing boundary it verifies that all three `MUL_MAT_ID` nodes still reference those exact tensors, the selected IDs are on the same Metal backend, and no scheduler copy rewrote either source. A mismatch aborts before routed work is submitted.
+The integrated path does not substitute buffers. Cache tensors are pre-allocated in the fixed Metal buffer before graph splitting. Each layer also has a dedicated remapped-ID input pinned to Metal. At the routing boundary the runtime verifies that all three `MUL_MAT_ID` nodes still reference the exact cache tensors and that dedicated input. A source or backend mismatch aborts before routed work is submitted.
+
+## Parity failure and correction
+
+The first real run completed but emitted `,` instead of the resident reference token `The`. A callback comparison found the first divergence at layer 0: the resident `ffn_moe_out` sum was `-0.197129`, while the streamed result was zero. The original IDs were correct (`434,308,37,309,367,2,226,386,118,201`), the remapped slots were `0..9`, and all 30 selected gate/up/down cache records matched positional reads from the GGUF byte for byte.
+
+The fault was the ID handoff. The old graph changed the computed `ffn_moe_topk` payload at the normalized-weight boundary and expected later scheduled work to consume the change. A computed intermediate is not a stable publication input across scheduler splits. The routed `MUL_MAT_ID` work observed the original IDs, which are outside the 64-slot cache tensor, and returned zeros.
+
+The correction leaves `ffn_moe_topk` untouched and publishes slots through a separate Metal-assigned I32 input. A reference callback then captured all 48 `ffn_moe_topk` and all 48 `ffn_moe_out` tensors for one token. Every captured byte matched between resident and streamed runs. The final dirty-tree generation emitted the expected `The`; swap stayed at 14131.44 MiB and free memory stayed at 87%. Layer 0 and layer 47 output hashes are recorded in the capability file.
 
 ## Scope and failure gates
 
 Only ubatches with exactly one token may execute while the feature is enabled. Prefill, multi-sequence token-generation batches, malformed cache settings, non-Metal execution, merged gate/up tensors, LoRA/scaled routed tensors, and scheduler source rewrites fail closed. The ordinary path is unchanged when the flag is disabled.
 
-This patch does not implement PLE row streaming or an address-table kernel. It also does not claim real-model correctness parity.
+This patch does not implement PLE row streaming or an address-table kernel. Its correctness claim is limited to the verified one-token path.
 
 ## Build and test
 
@@ -49,6 +57,6 @@ The bootstrap creates a unique `/private/tmp/origami-expert-graph-bootstrap.*` s
 scripts/bootstrap-expert-streaming-llama-cpp.sh
 ```
 
-The C++ test covers exact mixed-quant reads, cache hits and eviction, completion ownership, EOF rejection, strict feature/token gates, Metal cache-tensor binding, and a scheduler callback graph proving that an ID rewritten after a synchronized boundary is consumed by the following `MUL_MAT_ID` while buffer identity and backend assignment stay fixed.
+The C++ test covers exact mixed-quant reads, cache hits and eviction, completion ownership, EOF rejection, strict feature/token gates, Metal cache-tensor binding, and the separate original/remapped ID contract across a scheduler callback.
 
-`validation/expert-streaming-capabilities.json` records the compiled capabilities and validation limit. The combined source built and the synthetic tests passed in a unique private tree. A real model was not launched because the primary 65K probe was active. The remaining boundary is a one-token-at-a-time real Qwen4Exp load/decode and logits/token parity run; no compile-time blocker is currently known.
+`validation/expert-streaming-capabilities.json` records the compiled capabilities and real-model evidence. Validation used batch size 32, ubatch size 1, and 64 cache slots in a unique private tree. The one-token callback tensors matched the resident reference byte for byte, with no mmap routed fallback.

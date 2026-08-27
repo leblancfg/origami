@@ -59,13 +59,13 @@ Packing is resumable and atomically publishes a fixed-format binary pack plus JS
 
 ## Exact expert graph boundary
 
-The pinned `213df585` patch now connects fixed-size Metal expert slots to Qwen4Exp single-token evaluation. It derives exact GGUF slices, omits routed bodies from model buffers, stops after final normalized routing weights, remaps selected IDs to fixed cache slots for routed `MUL_MAT_ID`, restores the IDs after synchronized `ffn_moe_out`, and retires slot leases behind Metal events. Enabled mode has no mmap routed fallback and rejects prefill.
+The pinned `213df585` patch connects fixed-size Metal expert slots to Qwen4Exp single-token evaluation. It derives exact GGUF slices, omits routed bodies from model buffers, preserves the router's selected IDs for weight lookup, and publishes cache slots through separate Metal-assigned inputs for routed `MUL_MAT_ID`. Leases retire after synchronized `ffn_moe_out` behind Metal events. Enabled mode has no mmap routed fallback and rejects prefill.
 
 ```sh
 scripts/bootstrap-expert-streaming-llama-cpp.sh
 ```
 
-The full static library and synthetic scheduler/cache test build without launching a model. Real-model one-token decode and parity remain unrun. See [docs/expert-streaming.md](docs/expert-streaming.md) and [the capability record](validation/expert-streaming-capabilities.json).
+The full static library and scheduler/cache test build successfully. On the real Qwen artifact, all 48 selected-ID tensors and all 48 `ffn_moe_out` tensors matched a resident one-token reference callback byte for byte. See [docs/expert-streaming.md](docs/expert-streaming.md) and [the capability record](validation/expert-streaming-capabilities.json).
 
 ## Long-context research profile
 
