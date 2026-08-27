@@ -114,11 +114,27 @@ class ContextProfileTests(unittest.TestCase):
         )
         self.assertEqual(metrics["llamacpp:n_tokens_max"], 980)
 
-    def test_pi_sample_is_deliberately_not_loadable(self):
+    def test_explicit_ssd_profile_declares_native_window_and_bounded_cache(self):
+        profile = json.loads((ROOT / "config" / "qwen38-explicit-ssd-262144.json").read_text())
+        self.assertEqual(profile["status"], "single-sequence-text-validated")
+        self.assertEqual(profile["server"]["context_tokens"], 262144)
+        self.assertEqual(profile["server"]["cache_slots"], 10)
+        self.assertEqual(profile["server"]["routed_weight_placement"], "bounded-explicit-pread")
+        self.assertEqual(profile["validated"]["maximum_swap_growth_bytes"], 0)
+        completed = subprocess.run(
+            ["bash", "-n", str(ROOT / "scripts" / "start-explicit-ssd-server.sh")],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_pi_sample_declares_validated_explicit_ssd_window(self):
         config = json.loads((ROOT / "config" / "pi-model-origami-262144.json").read_text())
-        self.assertEqual(config["status"], "blocked-not-a-pi-configuration")
-        self.assertEqual(config["proposed_context_window"], 262144)
-        self.assertNotIn("providers", config)
+        provider = config["providers"]["origami-local"]
+        model = provider["models"][0]
+        self.assertEqual(provider["baseUrl"], "http://127.0.0.1:18080/v1")
+        self.assertEqual(model["id"], "origami-qwen38-ssd-262144")
+        self.assertEqual(model["contextWindow"], 262144)
+        self.assertLess(model["maxTokens"], model["contextWindow"])
 
     def test_yarn_targets_are_separate_and_unvalidated(self):
         index = json.loads((ROOT / "config" / "qwen38-context-yarn-research.json").read_text())

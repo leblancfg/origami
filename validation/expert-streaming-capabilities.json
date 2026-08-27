@@ -6,7 +6,8 @@
   "capabilities": {
     "gguf_derived_exact_expert_slices": true,
     "routed_tensors_excluded_from_model_buffers": true,
-    "mmap_disabled_while_exact_path_is_enabled": true,
+    "routed_tensors_absent_from_mmap_envelopes": true,
+    "resident_and_ple_mmap_allowed": true,
     "bounded_metal_expert_cache": true,
     "router_output_eval_callback_boundary": true,
     "original_ids_never_mutated": true,

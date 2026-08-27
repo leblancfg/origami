@@ -67,16 +67,18 @@ scripts/bootstrap-expert-streaming-llama-cpp.sh
 
 The full static library and scheduler/cache test build successfully. On the real Qwen artifact, all 48 selected-ID tensors and all 48 `ffn_moe_out` tensors matched a resident one-token reference callback byte for byte. See [docs/expert-streaming.md](docs/expert-streaming.md) and [the capability record](validation/expert-streaming-capabilities.json).
 
-## Long-context research profile
+## Native 262K SSD profile
 
-The GGUF declares a native 262,144-token window. The guarded candidate uses the 213df585 runtime plus the checked-in patch: Q8_0 main attention KV, an F16 key-only indexer cache, quantized-cache rotation support, and opt-in shared QSA graph inputs. It requests 250,000 tokens and has not completed an allocation or prompt probe.
+The explicit routed-expert server now allocates the model's native 262,144-cell context on the 64 GB M2 Max. It combines Q8_0 main KV, an F16 key-only QSA indexer, shared QSA graph inputs, ten exact expert cache slots, sparse-mmap PLE, and one-token physical ubatches.
 
 ```sh
-# Prints status and the missing backend capabilities. It does not inspect shards.
-scripts/context-profile.sh status
+ORIGAMI_DEPS_ROOT=/private/tmp/origami-expert-runtime \
+ORIGAMI_BUILD_RUNTIME=1 \
+scripts/bootstrap-expert-streaming-llama-cpp.sh
 
-# Requires a matching bootstrap build and a complete model manifest.
-scripts/context-profile.sh command /path/to/UD-IQ1_S
+scripts/start-explicit-ssd-server.sh /path/to/UD-IQ1_S
 ```
 
-No native-context allocation has run on the test host. The shared-input prototype cuts the guarded profile's logical QSA host inputs from 132,059,136 to 11,004,928 bytes, but leaves dense masks and dense attention in the graph. Factor-2 524,288 and factor-4 1,000,000 static-YaRN work use separate nonlaunchable configs. See [docs/context-profile.md](docs/context-profile.md) and [the QSA build record](docs/results/qsa-shared-inputs-213df585.md).
+Allocation and sustained decode produced no swap growth or swap-outs. A 32-token request decoded at 4.99 tokens/s, and temporary Pi interaction passed with `contextWindow: 262144`. See [the measured result](docs/results/qwen38-explicit-ssd-262k.md), [the runtime profile](config/qwen38-explicit-ssd-262144.json), and [the Pi provider example](config/pi-model-origami-262144.json).
+
+Factor-2 524,288 and factor-4 1,000,000 static-YaRN work remain separate nonlaunchable research profiles. The dense QSA attention core and sparse-mmap PLE remain optimization targets.

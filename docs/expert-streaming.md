@@ -9,7 +9,7 @@ The path is enabled only when `LLAMA_EXPLICIT_EXPERT_STREAMING=1`. Missing or `0
 - Qwen4Exp records each routed tensor's GGUF shard, absolute body offset, type, shape, and expert stride from `llama_model_loader`.
 - It requires separate, contiguous gate/up/down tensors and complete metadata for all layers and experts.
 - The routed tensors are consumed with `TENSOR_SKIP`, so no routed `ggml_tensor`, model-buffer allocation, or load destination is created.
-- mmap is disabled for the enabled model load. Dense, shared-expert, PLE, and router tensors use ordinary allocated backend buffers. This is deliberately stricter than retaining an unused routed mmap envelope.
+- Routed tensors are absent from model contexts and mmap envelopes. Dense, shared-expert, PLE, and router tensors may retain ordinary mmap loading; this keeps the 28.8 GB PLE table sparse without providing any routed-expert fallback.
 - The cache reopens the exact GGUF shard paths and uses bounded positional reads. A short read, unsupported quant type, malformed shape, missing path, or out-of-range span aborts.
 
 Gate and up accept IQ1_S or IQ2_XXS independently. Down requires IQ4_NL. Bytes are copied without conversion.

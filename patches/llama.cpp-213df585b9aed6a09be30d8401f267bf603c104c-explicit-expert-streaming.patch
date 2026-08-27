@@ -1472,21 +1472,6 @@ diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 index cc814830b7362705726c022959d824b5f0af314e..a8c34d38b443ca3aa28904c5b7c1ea3e8e2fc745 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1376,6 +1376,14 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
- }
- 
- bool llama_model_base::load_tensors(llama_model_loader & ml) {
-+    // The strict expert path must never retain a mapped route as an accidental
-+    // fallback. Dense/shared/PLE tensors are loaded into ordinary backend
-+    // buffers; routed bodies are skipped below by the Qwen4Exp loader.
-+    if (expert_stream_info() != nullptr && ml.use_mmap) {
-+        LLAMA_LOG_INFO("%s: explicit expert streaming disables mmap for resident tensors\n", __func__);
-+        ml.use_mmap = false;
-+    }
-+
-     const auto & split_mode   = params.split_mode;
-     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
-     const auto & tensor_split = params.tensor_split;
 @@ -2161,6 +2169,10 @@ bool llama_model::has_tensor_overrides() const {
      return pimpl->has_tensor_overrides;
  }

@@ -2,9 +2,11 @@
 
 ## Operational status
 
-No checked-in long-context profile is launchable. The short 512-token PoC remains the only approved llama.cpp command in this repository.
+The earlier blocked analysis below has been superseded by the validated `213df585` explicit-SSD profile. Origami now allocates 262,144 context cells, streams routed experts through ten bounded `pread` slots, keeps the QSA routing key F16, and exposes the full window to temporary Pi. Allocation, one-token intermediate parity, sustained decode, and Pi end-to-end checks pass without swap growth or swap-outs.
 
-The two integrated reports measured different parts of the same path. The 262,144-token profile chose Q8_0 for both attention and indexer caches. At pinned llama.cpp commit `bea3b12daee45876b0129a3602dc8f534ce30bf0`, that choice creates Hadamard cache-rotation tensors and then reaches an unconditional QSA assertion that requires those tensors to be null. The byte ledger is correct, but the graph cannot be constructed. Disabling rotation would make an untested lossy path and is not an acceptable workaround.
+Use [`config/qwen38-explicit-ssd-262144.json`](../config/qwen38-explicit-ssd-262144.json), [`scripts/start-explicit-ssd-server.sh`](../scripts/start-explicit-ssd-server.sh), and [the measured result](results/qwen38-explicit-ssd-262k.md). The remainder of this document records the constraints and evidence that led to that profile; statements describing the path as blocked are historical.
+
+The two original reports measured different parts of the mmap reference path. At pinned llama.cpp commit `bea3b12daee45876b0129a3602dc8f534ce30bf0`, quantized QSA cache construction asserted and long-context operation was unavailable. The validated profile moved to `213df585`, integrated the post-pin QSA/state fixes, split cache types, shared QSA inputs, and explicit expert streaming.
 
 The evidence supports five separate findings:
 
@@ -42,7 +44,7 @@ The gate requires these named capabilities:
 
 An upstream capability entry must contain the exact fixing commit recorded by the profile. The local split needs nonempty build evidence, and the manifest's runtime revision must match the profile. Revision and patch markers remain mandatory. The gate is an execution interlock, not a correctness certificate.
 
-The Pi file at [`config/pi-model-origami-262144.json`](../config/pi-model-origami-262144.json) is intentionally not a Pi provider configuration. Publishing a client-side 262,144-token budget before a server passes the gates would turn an unavailable backend into an apparently selectable model.
+The Pi file at [`config/pi-model-origami-262144.json`](../config/pi-model-origami-262144.json) is now a loadable provider example for the validated explicit-SSD server. Earlier revisions kept it deliberately blocked until the server passed allocation and generation gates.
 
 ## Upstream trace
 

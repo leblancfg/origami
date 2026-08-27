@@ -17,7 +17,7 @@ class ExpertStreamingPatchTests(unittest.TestCase):
         data = PATCH.read_bytes()
         self.assertEqual(
             hashlib.sha256(data).hexdigest(),
-            "d6a49170fdadd147896c4ab1e40402aaa3f7b5afaa647887a0a0075df4079848",
+            "75584a1370fc16bf97f32d6993e250b5ae674e2af6e7935a058e2f9779868617",
         )
         changed = {
             line.removeprefix("+++ b/")
