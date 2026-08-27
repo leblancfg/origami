@@ -64,6 +64,26 @@ A monitored 32-token request completed at 4.99 tokens/s with no swap growth or s
 
 The temporary Pi provider declared `contextWindow: 262144` and returned the exact requested `SSD_262K_OK` response.
 
+## Restart repeatability
+
+The exact committed ten-slot profile was stopped, allocated again, and exercised through decode and Pi:
+
+| Measurement | Restarted instance |
+|---|---:|
+| Declared context | 262,144 |
+| Allocation pressure minimum | 16% |
+| Allocation compressor growth | 1,500,512,256 bytes |
+| Allocation swap growth | 0 bytes |
+| Allocation swap-outs | 0 pages |
+| Decode tokens | 32 |
+| Decode throughput | 5.02 tokens/s |
+| Decode pressure minimum | 16% |
+| Decode compressor growth | 71,614,464 bytes |
+| Decode swap growth | 0 bytes |
+| Pi response | `SSD_262K_STABLE` |
+
+Rejected configurations and the discarded cycle-56 harness result remain in the orchestration evidence; they are not counted as passing runs.
+
 ## Launch
 
 Build the explicit runtime:
