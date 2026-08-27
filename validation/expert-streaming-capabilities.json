@@ -1,0 +1,30 @@
+{
+  "schema_version": "origami.expert-streaming-capabilities.v2",
+  "runtime_revision": "213df585b9aed6a09be30d8401f267bf603c104c",
+  "status": "launch-boundary-compiled-real-model-not-run",
+  "strict_feature_flag": "LLAMA_EXPLICIT_EXPERT_STREAMING=1",
+  "capabilities": {
+    "gguf_derived_exact_expert_slices": true,
+    "routed_tensors_excluded_from_model_buffers": true,
+    "mmap_disabled_while_exact_path_is_enabled": true,
+    "bounded_metal_expert_cache": true,
+    "final_weight_eval_callback_boundary": true,
+    "original_ids_read_after_normalized_weights": true,
+    "selected_ids_remapped_to_cache_slots": true,
+    "fixed_cache_buffer_assigned_before_scheduler_split": true,
+    "dynamic_tensor_buffer_substitution": false,
+    "ids_restored_after_synchronized_ffn_moe_out": true,
+    "lease_retired_with_metal_event": true,
+    "single_token_decode": true,
+    "prefill": false,
+    "mmap_routed_fallback": false
+  },
+  "validation": {
+    "combined_patch_apply": true,
+    "full_llama_static_library_build": true,
+    "synthetic_cache_and_scheduler_boundary_test": true,
+    "real_model_launch": false,
+    "real_model_reason": "Not attempted while the primary 65K probe is active, as required."
+  },
+  "remaining_blocker": "No code blocker is known from compile or synthetic tests. A real one-token-at-a-time Qwen4Exp load/decode has not been run; that is the remaining launch validation boundary."
+}

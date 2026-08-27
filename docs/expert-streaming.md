@@ -1,47 +1,54 @@
-# Explicit Qwen4Exp expert reads
+# Exact Qwen4Exp expert reads and graph boundary
 
 ## Artifact
 
-`patches/llama.cpp-213df585b9aed6a09be30d8401f267bf603c104c-explicit-expert-streaming.patch` adds a compilable private llama.cpp subsystem and its C++ test. The patch applies to the pinned revision by itself and after the checked-in long-context patch.
+`patches/llama.cpp-213df585b9aed6a09be30d8401f267bf603c104c-explicit-expert-streaming.patch` applies after the checked-in long-context patch. It integrates explicit routed-expert reads into the Qwen4Exp single-token graph at the pinned revision.
 
-The subsystem does four jobs:
+The path is enabled only when `LLAMA_EXPLICIT_EXPERT_STREAMING=1`. Missing or `0` leaves upstream loading and graph construction unchanged. Any other value fails model loading. Once enabled, there is no mmap routed-tensor fallback:
 
-- It opens the GGUF shards and reads each gate, up, and down slice by exact offset and byte count. macOS uses `pread`; a short read fails the request.
-- It allocates a fixed number of fixed-size backend slots. Capacity is `cache_slots * slot_bytes`. Acquisition fails when Metal still owns every eviction candidate.
-- It accepts IQ1_S or IQ2_XXS independently for gate and up, and requires IQ4_NL for down. It copies the quantized payload without conversion and returns views in router order.
-- It records a Metal shared event after submitted graph work. A worker releases slot references only after that event signals.
+- Qwen4Exp records each routed tensor's GGUF shard, absolute body offset, type, shape, and expert stride from `llama_model_loader`.
+- It requires separate, contiguous gate/up/down tensors and complete metadata for all layers and experts.
+- The routed tensors are consumed with `TENSOR_SKIP`, so no routed `ggml_tensor`, model-buffer allocation, or load destination is created.
+- mmap is disabled for the enabled model load. Dense, shared-expert, PLE, and router tensors use ordinary allocated backend buffers. This is deliberately stricter than retaining an unused routed mmap envelope.
+- The cache reopens the exact GGUF shard paths and uses bounded positional reads. A short read, unsupported quant type, malformed shape, missing path, or out-of-range span aborts.
 
-`LLAMA_EXPLICIT_EXPERT_STREAMING` must equal `1` before the cache can be created. Missing, `0`, and malformed values leave the path unavailable. Acquisition also rejects batches with any token count other than one. There is no fallback to mmap expert access inside this subsystem.
+Gate and up accept IQ1_S or IQ2_XXS independently. Down requires IQ4_NL. Bytes are copied without conversion.
+
+## Single-token launch boundary
+
+The Qwen4Exp graph replaces each omitted routed tensor with a strided view over one fixed Metal cache buffer. The views are allocated before scheduler split and backend assignment. Their buffer, type, dimensions, and stride never change during evaluation.
+
+The scheduler callback creates two synchronized boundaries per layer:
+
+1. `build_moe_ffn()` expands the final normalized and scaled `ffn_moe_weights`. The callback then reads the original selected IDs. Weight lookup has already consumed those IDs, preserving router order and values.
+2. The cache acquires the corresponding gate/up/down records. The callback rewrites only the allocated I32 selected-ID payload from original expert numbers to physical cache-slot numbers.
+3. Routed gate, up, and down `MUL_MAT_ID` nodes execute against the fixed cache views.
+4. After synchronized `ffn_moe_out`, the callback restores the original selected IDs and retires the lease behind a Metal event recorded after the submitted work.
+
+`LLAMA_EXPERT_CACHE_SLOTS` sets the fixed slot count. It must be an unsigned integer at least as large as `expert_used_count`; the default is twice that count. Slot size is derived from the largest real GGUF gate/up/down record and padded to 4 KiB. Capacity is exactly `slots * slot_bytes`.
+
+The scheduler callback now returns `GGML_STATUS_ABORTED` when a callback rejects a boundary. It no longer continues into later backend splits after a fail-closed routing error.
+
+## Why tensor-buffer substitution was rejected
+
+Changing a tensor's buffer after scheduler allocation is not safe at this revision. Backend assignment and cross-backend copies are decided in `ggml_backend_sched_split_graph()`. The scheduler may replace a node source with a copy tensor, and its MoE copy optimization runs before eval callbacks. Swapping the original tensor's buffer at the callback would therefore be invisible to some scheduled nodes or would disagree with their precomputed backend.
+
+The integrated path does not substitute buffers. Cache tensors are pre-allocated in the fixed Metal buffer before graph splitting. At the routing boundary it verifies that all three `MUL_MAT_ID` nodes still reference those exact tensors, the selected IDs are on the same Metal backend, and no scheduler copy rewrote either source. A mismatch aborts before routed work is submitted.
+
+## Scope and failure gates
+
+Only ubatches with exactly one token may execute while the feature is enabled. Prefill, multi-sequence token-generation batches, malformed cache settings, non-Metal execution, merged gate/up tensors, LoRA/scaled routed tensors, and scheduler source rewrites fail closed. The ordinary path is unchanged when the flag is disabled.
+
+This patch does not implement PLE row streaming or an address-table kernel. It also does not claim real-model correctness parity.
 
 ## Build and test
 
-The bootstrap uses a separate source and build directory. It applies the long-context patch first, applies the expert patch, builds only the synthetic test target and its dependencies, and does not start llama-cli or llama-server.
+The bootstrap creates a unique `/private/tmp/origami-expert-graph-bootstrap.*` source/build root unless `ORIGAMI_DEPS_ROOT` is explicitly supplied. It applies the long-context and expert patches, builds the full static llama library plus `test-expert-stream`, and never starts llama-cli or llama-server:
 
 ```sh
 scripts/bootstrap-expert-streaming-llama-cpp.sh
 ```
 
-`test-expert-stream` checks mixed quant types against patterned spans in two synthetic shards. It also checks router order, cache hits and eviction, EOF rejection, feature and token gates, blocked-slot behavior with a controlled completion, and the real Metal event path without loading a model.
+The C++ test covers exact mixed-quant reads, cache hits and eviction, completion ownership, EOF rejection, strict feature/token gates, Metal cache-tensor binding, and a scheduler callback graph proving that an ID rewritten after a synchronized boundary is consumed by the following `MUL_MAT_ID` while buffer identity and backend assignment stay fixed.
 
-## Remaining graph boundary
-
-The patch stops at the first boundary that cannot fit into the current monolithic Qwen4Exp graph:
-
-```text
-llama_model_qwen4exp::graph::build_layer_ffn
-  -> llm_graph_context::build_moe_ffn
-       ffn_moe_logits
-       ffn_moe_probs
-       ffn_moe_topk / normalized weights
-       ggml_build_forward_expand(gf, weights)
-       [missing host-visible routing boundary]
-       first MUL_MAT_ID for up/gate
-       second MUL_MAT_ID for down
-```
-
-The runtime must submit the graph through `ffn_moe_topk` and normalized weights, read the ten selected IDs without changing their order or values, acquire their slices, then resume the layer with compact expert tensors. Existing `MUL_MAT_ID` assumes one tensor containing all 512 experts and indexes it with the original IDs. The resume graph therefore needs either:
-
-1. compact gate/up/down tensors plus selected IDs remapped to compact positions while retaining the original weights and order, or
-2. a Metal `MUL_MAT_ID` variant that accepts per-expert buffer addresses.
-
-After submitting the resumed Metal graph, the caller must create `llama_expert_stream_metal_completion()` and pass it with the lease to `retire()`. Full graph integration must also stop routed tensor bodies from entering the mmap Metal envelopes. Until both changes exist, the capability manifest reports `vertical-slice-only-not-launchable`, and the ordinary llama.cpp path remains unchanged.
+`validation/expert-streaming-capabilities.json` records the compiled capabilities and validation limit. The combined source built and the synthetic tests passed in a unique private tree. A real model was not launched because the primary 65K probe was active. The remaining boundary is a one-token-at-a-time real Qwen4Exp load/decode and logits/token parity run; no compile-time blocker is currently known.

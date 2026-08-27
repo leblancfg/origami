@@ -57,15 +57,15 @@ python3 -m origami_artifacts.sidecar index /path/to/UD-IQ1_S \
 
 Packing is resumable and atomically publishes a fixed-format binary pack plus JSON index. Sample/full byte verification, an aligned `pread` API, and a benchmark command are included. See [docs/expert-sidecar.md](docs/expert-sidecar.md) for the exact format and recovery contract.
 
-## Explicit expert-read vertical slice
+## Exact expert graph boundary
 
-The pinned `213df585` patch adds fixed-size expert slots, exact positional reads for mixed IQ1_S/IQ2_XXS/IQ4_NL slices, and Metal-event slot retirement. Its synthetic test loads no model. The feature remains fail-closed because Qwen4Exp still needs a routing/compute graph split before the first routed `MUL_MAT_ID`.
+The pinned `213df585` patch now connects fixed-size Metal expert slots to Qwen4Exp single-token evaluation. It derives exact GGUF slices, omits routed bodies from model buffers, stops after final normalized routing weights, remaps selected IDs to fixed cache slots for routed `MUL_MAT_ID`, restores the IDs after synchronized `ffn_moe_out`, and retires slot leases behind Metal events. Enabled mode has no mmap routed fallback and rejects prefill.
 
 ```sh
 scripts/bootstrap-expert-streaming-llama-cpp.sh
 ```
 
-See [docs/expert-streaming.md](docs/expert-streaming.md) for the implemented contract and remaining call boundary.
+The full static library and synthetic scheduler/cache test build without launching a model. Real-model one-token decode and parity remain unrun. See [docs/expert-streaming.md](docs/expert-streaming.md) and [the capability record](validation/expert-streaming-capabilities.json).
 
 ## Long-context research profile
 
